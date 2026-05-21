@@ -1,8 +1,10 @@
 import torch,datetime,os,logging,json,time,sys
 import numpy as np
-from box import Box
+from rxngraphormer.config import Box, load_config, resolve_config_file
 from .model import RXNGRegressor,RXNGClassifier,RXNG2Sequencer,RXNGraphormer
-from .utils import setup_logger,grad_norm,param_norm,get_lr,update_dict_key,add_dense_empty_node_edge,align_config
+from .checkpointing import CheckpointAdapter
+from .dataloader import dataloader_kwargs, dataloader_settings_from_config
+from .utils import setup_logger,grad_norm,param_norm,get_lr,as_bool,add_dense_empty_node_edge,align_config
 from torch.optim import Adam,AdamW
 from torch_geometric.loader import DataLoader
 from torch.optim.lr_scheduler import StepLR
@@ -10,11 +12,20 @@ from torch import nn
 from torch.nn.init import xavier_uniform_
 from .data import RXNDataset,get_idx_split,RXNG2SDataset,load_vocab,MultiRXNDataset,PairDataset,pair_collate_fn,TripleDataset,triple_collate_fn
 from .scheduler import get_linear_scheduler_with_warmup,NoamLR
+from .evaluator import evaluate_regression
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import r2_score
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from rdkit import Chem
+
+
+def _config_section(config, name):
+    return getattr(config, name, Box({}))
+
+
+def _config_get(section, name, default=None):
+    return getattr(section, name, default)
 
 
 class SPLITClassifierTrainer():
@@ -128,11 +139,12 @@ class SPLITClassifierTrainer():
                                             num_workers=0)
             
         if self.config.model.pretrained_model:
-            pretrained_inf = torch.load(f'{self.config.model.pretrained_model}/model/valid_checkpoint.pt')
-            model_state_dict = pretrained_inf['model_state_dict']
-            optimizer_state_dict = pretrained_inf['optimizer_state_dict']
-            scheduler_state_dict = pretrained_inf['scheduler_state_dict']
-            self.model.load_state_dict(model_state_dict)
+            CheckpointAdapter().load_into_model(
+                self.model,
+                f'{self.config.model.pretrained_model}/model/valid_checkpoint.pt',
+                map_location="cpu",
+                mode="strict",
+            )
             if not self.multi_gpu:
                 self.model.to(self.device)
             else:
@@ -204,10 +216,12 @@ class SPLITClassifierTrainer():
         self.model.train()
         loss_accum = 0
         acc_lst = []
+        g_norm = 0.0
+        accum_steps = max(1, int(self.config.training.accum))
+        self.optimizer.zero_grad()
         if self.multi_gpu:
             self.train_dataloader.sampler.set_epoch(self.epoch)
         for step, batch_data in enumerate(self.train_dataloader):
-            self.optimizer.zero_grad()
             rct_data,pdt_data = batch_data
             if not self.multi_gpu:
                 rct_data = rct_data.to(self.device)
@@ -217,17 +231,17 @@ class SPLITClassifierTrainer():
                 pdt_data = pdt_data.to(self.local_rank)
 
 
-            out = self.model([rct_data,pdt_data])
-            loss = self.loss_func(out, rct_data.y)
-            acc_lst.append((out.argmax(dim=1) == rct_data.y).float().mean().cpu())
-            loss.backward()
-            if (step+1) % self.config.training.accum == 0:
+            logits = self.model.logits([rct_data,pdt_data])
+            loss = self.loss_func(logits, rct_data.y)
+            acc_lst.append((logits.argmax(dim=1) == rct_data.y).float().mean().cpu())
+            (loss / accum_steps).backward()
+            if (step+1) % accum_steps == 0:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.clip_norm)
                 self.optimizer.step()
                 if self.config.scheduler.type.lower() == 'noamlr':
                     self.scheduler.step()
                 g_norm = grad_norm(self.model)
-                self.model.zero_grad()
+                self.optimizer.zero_grad()
             
             loss_accum += loss.detach().cpu().item()
             if (step+1) % self.config.training.log_iter_step == 0:
@@ -237,17 +251,20 @@ class SPLITClassifierTrainer():
                     logging.info(f'Training step {step+1}, gradient norm: {g_norm:.8f}, parameters norm: {p_norm:.8f}, lr: {lr_cur}, loss: {loss_accum/(step+1):.4f}, acc: {np.mean(acc_lst):.4f}')
                 elif not self.multi_gpu:
                     logging.info(f'Training step {step+1}, gradient norm: {g_norm:.8f}, parameters norm: {p_norm:.8f}, lr: {lr_cur}, loss: {loss_accum/(step+1):.4f}, acc: {np.mean(acc_lst):.4f}')
+        if (step + 1) % accum_steps != 0:
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.clip_norm)
+            self.optimizer.step()
+            if self.config.scheduler.type.lower() == 'noamlr':
+                self.scheduler.step()
+            self.optimizer.zero_grad()
         loss_ave = loss_accum/(step+1)
         acc_ave = np.mean(acc_lst)
         return loss_ave,acc_ave
     def val(self,dataloader):
         self.model.eval()
-        if not self.multi_gpu:
-            preds = torch.Tensor([]).to(self.device)
-            targets = torch.Tensor([]).to(self.device)
-        else:
-            preds = torch.Tensor([]).to(self.local_rank)
-            targets = torch.Tensor([]).to(self.local_rank)
+        preds_lst = []
+        targets_lst = []
+        if self.multi_gpu:
             dataloader.sampler.set_epoch(self.epoch)
         with torch.no_grad():
             for step, batch_data in enumerate(dataloader):
@@ -260,8 +277,10 @@ class SPLITClassifierTrainer():
                     pdt_data = pdt_data.to(self.local_rank)
                 out = self.model([rct_data,pdt_data])
                 pred = torch.argmax(out, dim=1)
-                preds = torch.cat([preds, pred.detach_()], dim=0)
-                targets = torch.cat([targets, rct_data.y.unsqueeze(1)], dim=0)
+                preds_lst.append(pred.detach().cpu())
+                targets_lst.append(rct_data.y.detach().cpu())
+        preds = torch.cat(preds_lst, dim=0)
+        targets = torch.cat(targets_lst, dim=0)
         return (preds == targets.view(-1)).float().mean().cpu().item()
     
     def run(self):
@@ -311,7 +330,21 @@ class SPLITRegressorTrainer():
     def __init__(self,config):
         self.config = config
         self.device = self.config.others.device if torch.cuda.is_available() else "cpu"
-        self.use_mid_inf = eval(self.config.model.use_mid_inf)
+        self.runtime_config = _config_section(self.config, "runtime")
+        self.enable_amp = as_bool(
+            _config_get(
+                self.runtime_config,
+                "enable_amp",
+                _config_get(self.config.others, "enable_amp", False),
+            )
+        )
+        self.amp_dtype = _config_get(self.runtime_config, "amp_dtype", "fp16")
+        self.test_every_n_epochs = max(0, int(_config_get(self.runtime_config, "test_every_n_epochs", 1)))
+        self.log_epoch_time = as_bool(_config_get(self.runtime_config, "log_epoch_time", True))
+        self.log_gpu_memory = as_bool(_config_get(self.runtime_config, "log_gpu_memory", True))
+        if as_bool(_config_get(self.runtime_config, "deterministic", False)):
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        self.use_mid_inf = as_bool(self.config.model.use_mid_inf)
         if self.config.data.rct_data_file:
             prefix = self.config.data.rct_data_file.split('.')[0][:20]
         else:
@@ -336,16 +369,16 @@ class SPLITRegressorTrainer():
                                         onum_layer=self.config.model.output_num_layer,
                                         drop_ratio=self.config.model.drop_ratio,
                                         output_size=1,
-                                        output_norm=eval(self.config.model.output_norm),
+                                        output_norm=as_bool(self.config.model.output_norm),
                                         split_process=True,
                                         split_merge_method=self.config.model.split_merge_method,
                                         output_act_func=self.config.model.output_act_func,
-                                        rct_batch_norm=eval(self.config.model.rct_batch_norm),
-                                        pdt_batch_norm=eval(self.config.model.pdt_batch_norm),
+                                        rct_batch_norm=as_bool(self.config.model.rct_batch_norm),
+                                        pdt_batch_norm=as_bool(self.config.model.pdt_batch_norm),
                                         use_mid_inf=self.use_mid_inf,
                                         pretrained_mid_encoder=None,
                                         mid_iteract_method=self.config.model.mid_iteract_method,
-                                        mid_batch_norm=eval(self.config.model.mid_batch_norm),
+                                        mid_batch_norm=as_bool(self.config.model.mid_batch_norm),
                                         mid_layer_num=self.config.model.mid_layer_num)
             '''
             input_param = {"emb_dim":self.config.model.emb_dim,
@@ -361,15 +394,15 @@ class SPLITRegressorTrainer():
                             "onum_layer":self.config.model.output_num_layer,
                             "drop_ratio":self.config.model.drop_ratio,
                             "output_size":1,
-                            "output_norm":eval(self.config.model.output_norm),
+                            "output_norm":as_bool(self.config.model.output_norm),
                             "split_process":True,
                             "split_merge_method":self.config.model.split_merge_method,
                             "output_act_func":self.config.model.output_act_func,
-                            "rct_batch_norm":eval(self.config.model.rct_batch_norm),
-                            "pdt_batch_norm":eval(self.config.model.pdt_batch_norm),
+                            "rct_batch_norm":as_bool(self.config.model.rct_batch_norm),
+                            "pdt_batch_norm":as_bool(self.config.model.pdt_batch_norm),
                             "use_mid_inf":self.use_mid_inf,
                             "mid_iteract_method":self.config.model.mid_iteract_method,
-                            "mid_batch_norm":eval(self.config.model.mid_batch_norm),
+                            "mid_batch_norm":as_bool(self.config.model.mid_batch_norm),
                             "mid_layer_num":self.config.model.mid_layer_num}
             
             rxng = RXNGraphormer("regression",align_config(input_param,"regressor"),"") # pretrain models are all None
@@ -387,12 +420,8 @@ class SPLITRegressorTrainer():
             self.pretrained_lr_scaled_coef = self.config.model.pretrained_lr_scaled_coef
             self.save_dir += '_ft'
             logging.info('Loading pretrained model')
-            pretrained_para_json = f"{self.config.model.pretrained_model_path}/parameters.json"
-            with open(pretrained_para_json,'r') as fr:
-                pretrained_config_dict = json.load(fr)
-            pretrained_config = Box(pretrained_config_dict)
+            pretrained_config = load_config(resolve_config_file(self.config.model.pretrained_model_path))
             ckpt_file = f"{self.config.model.pretrained_model_path}/model/valid_checkpoint.pt"
-            ckpt_inf = torch.load(ckpt_file,map_location=self.device)
             '''
             self.pretrained_model = RXNGClassifier(emb_dim=pretrained_config.model.emb_dim,
                                                     gnn_type=pretrained_config.model.gnn_type,
@@ -431,10 +460,12 @@ class SPLITRegressorTrainer():
             rxng = RXNGraphormer("classification",align_config(input_param,"classifier"),"")
             self.pretrained_model = rxng.get_model()
             
-            pretrained_model_params = ckpt_inf['model_state_dict']
-            if list(pretrained_model_params.keys())[0].startswith("module."):
-                pretrained_model_params = update_dict_key(pretrained_model_params, "module.")
-            self.pretrained_model.load_state_dict(pretrained_model_params)
+            CheckpointAdapter().load_into_model(
+                self.pretrained_model,
+                ckpt_file,
+                map_location=self.device,
+                mode="strict",
+            )
             rct_encoder = self.pretrained_model.rct_encoder
             pdt_encoder = self.pretrained_model.pdt_encoder
             ## before initializing all model parameters, freeze the parameters in pretrained part
@@ -458,16 +489,16 @@ class SPLITRegressorTrainer():
                                         drop_ratio=self.config.model.drop_ratio,
                                         output_size=1,pretrained_rct_encoder=rct_encoder,
                                         pretrained_pdt_encoder=pdt_encoder,
-                                        output_norm=eval(self.config.model.output_norm),
+                                        output_norm=as_bool(self.config.model.output_norm),
                                         split_process=True,
                                         split_merge_method=self.config.model.split_merge_method,
                                         output_act_func=self.config.model.output_act_func,
-                                        rct_batch_norm=eval(self.config.model.rct_batch_norm),
-                                        pdt_batch_norm=eval(self.config.model.pdt_batch_norm),
+                                        rct_batch_norm=as_bool(self.config.model.rct_batch_norm),
+                                        pdt_batch_norm=as_bool(self.config.model.pdt_batch_norm),
                                         use_mid_inf=self.use_mid_inf,
                                         pretrained_mid_encoder=None,
                                         mid_iteract_method=self.config.model.mid_iteract_method,
-                                        mid_batch_norm=eval(self.config.model.mid_batch_norm),
+                                        mid_batch_norm=as_bool(self.config.model.mid_batch_norm),
                                         mid_layer_num=self.config.model.mid_layer_num)
                 '''
             
@@ -485,15 +516,15 @@ class SPLITRegressorTrainer():
                             "onum_layer":self.config.model.output_num_layer,
                             "drop_ratio":self.config.model.drop_ratio,
                             "output_size":1,
-                            "output_norm":eval(self.config.model.output_norm),
+                            "output_norm":as_bool(self.config.model.output_norm),
                             "split_process":True,
                             "split_merge_method":self.config.model.split_merge_method,
                             "output_act_func":self.config.model.output_act_func,
-                            "rct_batch_norm":eval(self.config.model.rct_batch_norm),
-                            "pdt_batch_norm":eval(self.config.model.pdt_batch_norm),
+                            "rct_batch_norm":as_bool(self.config.model.rct_batch_norm),
+                            "pdt_batch_norm":as_bool(self.config.model.pdt_batch_norm),
                             "use_mid_inf":self.use_mid_inf,
                             "mid_iteract_method":self.config.model.mid_iteract_method,
-                            "mid_batch_norm":eval(self.config.model.mid_batch_norm),
+                            "mid_batch_norm":as_bool(self.config.model.mid_batch_norm),
                             "mid_layer_num":self.config.model.mid_layer_num}
             
             rxng = RXNGraphormer("regression",align_config(input_param,"regressor"),"",{"pretrained_encoder": None,
@@ -594,10 +625,20 @@ class SPLITRegressorTrainer():
             self.train_dataset = TripleDataset(self.train_rct_dataset,self.train_pdt_dataset,self.train_mid_dataset)
             self.valid_dataset = TripleDataset(self.valid_rct_dataset,self.valid_pdt_dataset,self.valid_mid_dataset)
             self.test_dataset = TripleDataset(self.test_rct_dataset,self.test_pdt_dataset,self.test_mid_dataset)
-            
-            self.train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size=self.config.data.batch_size, shuffle=True,collate_fn=triple_collate_fn)
-            self.valid_dataloader = torch.utils.data.DataLoader(self.valid_dataset, batch_size=self.config.data.batch_size, shuffle=False,collate_fn=triple_collate_fn)
-            self.test_dataloader = torch.utils.data.DataLoader(self.test_dataset, batch_size=self.config.data.batch_size, shuffle=False,collate_fn=triple_collate_fn)
+
+            loader_settings = dataloader_settings_from_config(self.config)
+            self.train_dataloader = torch.utils.data.DataLoader(
+                self.train_dataset,
+                **dataloader_kwargs(loader_settings, shuffle=True, collate_fn=triple_collate_fn),
+            )
+            self.valid_dataloader = torch.utils.data.DataLoader(
+                self.valid_dataset,
+                **dataloader_kwargs(loader_settings, shuffle=False, collate_fn=triple_collate_fn),
+            )
+            self.test_dataloader = torch.utils.data.DataLoader(
+                self.test_dataset,
+                **dataloader_kwargs(loader_settings, shuffle=False, collate_fn=triple_collate_fn),
+            )
         else:
             assert len(self.train_rct_dataset) == len(self.train_pdt_dataset), 'Length of train dataset is not equal'
             assert len(self.valid_rct_dataset) == len(self.valid_pdt_dataset), 'Length of valid dataset is not equal'
@@ -605,10 +646,20 @@ class SPLITRegressorTrainer():
             self.train_dataset = PairDataset(self.train_rct_dataset,self.train_pdt_dataset)
             self.valid_dataset = PairDataset(self.valid_rct_dataset,self.valid_pdt_dataset)
             self.test_dataset = PairDataset(self.test_rct_dataset,self.test_pdt_dataset)
-            
-            self.train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size=self.config.data.batch_size, shuffle=True,collate_fn=pair_collate_fn)
-            self.valid_dataloader = torch.utils.data.DataLoader(self.valid_dataset, batch_size=self.config.data.batch_size, shuffle=False,collate_fn=pair_collate_fn)
-            self.test_dataloader = torch.utils.data.DataLoader(self.test_dataset, batch_size=self.config.data.batch_size, shuffle=False,collate_fn=pair_collate_fn)
+
+            loader_settings = dataloader_settings_from_config(self.config)
+            self.train_dataloader = torch.utils.data.DataLoader(
+                self.train_dataset,
+                **dataloader_kwargs(loader_settings, shuffle=True, collate_fn=pair_collate_fn),
+            )
+            self.valid_dataloader = torch.utils.data.DataLoader(
+                self.valid_dataset,
+                **dataloader_kwargs(loader_settings, shuffle=False, collate_fn=pair_collate_fn),
+            )
+            self.test_dataloader = torch.utils.data.DataLoader(
+                self.test_dataset,
+                **dataloader_kwargs(loader_settings, shuffle=False, collate_fn=pair_collate_fn),
+            )
        
 
         logging.info(f'[INFO] Training results will be saved in {self.save_dir}')
@@ -622,6 +673,7 @@ class SPLITRegressorTrainer():
             os.makedirs(self.model_save_dir)
         self.writer = SummaryWriter(log_dir=self.log_dir)
         self.config.to_json(filename=f"{self.save_dir}/parameters.json")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.enable_amp and torch.cuda.is_available())
         
     def init_optimizer(self):
         if self.config.model.pretrained_model_path and not self.pretrained_model_freeze:
@@ -670,53 +722,54 @@ class SPLITRegressorTrainer():
     def train(self):
         self.model.train()
         loss_accum = 0
+        g_norm = 0.0
+        accum_steps = max(1, int(self.config.training.accum))
+        self.optimizer.zero_grad()
+        autocast_dtype = torch.bfloat16 if self.amp_dtype == "bf16" else torch.float16
         for step, batch_data in enumerate(self.train_dataloader):
-            self.optimizer.zero_grad()
             if not self.use_mid_inf:
                 rct_data,pdt_data = batch_data
                 rct_data = rct_data.to(self.device)
                 pdt_data = pdt_data.to(self.device)
-                out = self.model([rct_data,pdt_data])
+                model_input = [rct_data,pdt_data]
             else:
                 rct_data,pdt_data,mid_data = batch_data
                 rct_data = rct_data.to(self.device)
                 pdt_data = pdt_data.to(self.device)
                 mid_data = mid_data.to(self.device)
-                out = self.model([rct_data,pdt_data,mid_data])
+                model_input = [rct_data,pdt_data,mid_data]
 
-            loss = self.loss_func(out, rct_data.y.unsqueeze(1))
-            loss.backward()
-            if (step+1) % self.config.training.accum == 0:
+            with torch.amp.autocast(
+                "cuda",
+                enabled=self.enable_amp and torch.cuda.is_available(),
+                dtype=autocast_dtype,
+            ):
+                out = self.model(model_input)
+                loss = self.loss_func(out, rct_data.y.unsqueeze(1))
+            self.scaler.scale(loss / accum_steps).backward()
+            if (step+1) % accum_steps == 0:
+                self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.clip_norm)
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 if self.config.scheduler.type.lower() == 'noamlr':
                     self.scheduler.step()
                 g_norm = grad_norm(self.model)
-                self.model.zero_grad()
+                self.optimizer.zero_grad()
             loss_accum += loss.detach().cpu().item()
+        if (step + 1) % accum_steps != 0:
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.clip_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            if self.config.scheduler.type.lower() == 'noamlr':
+                self.scheduler.step()
+            self.optimizer.zero_grad()
         loss_ave = loss_accum/(step+1)
         return loss_ave
     def val(self,dataloader):
-        self.model.eval()
-        preds = torch.Tensor([]).to(self.device)
-        targets = torch.Tensor([]).to(self.device)
-        with torch.no_grad():
-            for step, batch_data in enumerate(dataloader):
-                if not self.use_mid_inf:
-                    rct_data,pdt_data = batch_data
-                    rct_data = rct_data.to(self.device)
-                    pdt_data = pdt_data.to(self.device)
-                    out = self.model([rct_data,pdt_data])
-                else:
-                    rct_data,pdt_data,mid_data = batch_data
-                    rct_data = rct_data.to(self.device)
-                    pdt_data = pdt_data.to(self.device)
-                    mid_data = mid_data.to(self.device)
-                    out = self.model([rct_data,pdt_data,mid_data])
-                preds = torch.cat([preds, out.detach_()], dim=0)
-                targets = torch.cat([targets, rct_data.y.unsqueeze(1)], dim=0)
-        r2 = r2_score(targets.cpu(),preds.cpu())
-        return torch.mean(torch.abs(targets - preds)).cpu().item(),r2
+        result = evaluate_regression(self.model, dataloader, self.device)
+        return result.metrics.mae,result.metrics.r2
     
     def run(self):
         best_valid = float('inf')
@@ -725,6 +778,9 @@ class SPLITRegressorTrainer():
         best_test_r2 = -float('inf')
         self.model.zero_grad()
         for epoch in range(1, self.config.training.epoch + 1):
+            epoch_start = time.time()
+            if torch.cuda.is_available() and self.log_gpu_memory:
+                torch.cuda.reset_peak_memory_stats()
             logging.info(f'============= Epoch {epoch} =============')
             
             logging.info('Training...')
@@ -734,23 +790,43 @@ class SPLITRegressorTrainer():
             logging.info('Evaluating...')
             valid_mae,valid_r2 = self.val(self.valid_dataloader)
 
-            logging.info('Testing...')
-            test_mae,test_r2 = self.val(self.test_dataloader)
+            should_test = self.test_every_n_epochs > 0 and (
+                epoch == 1
+                or epoch == self.config.training.epoch
+                or epoch % self.test_every_n_epochs == 0
+            )
+            if should_test:
+                logging.info('Testing...')
+                test_mae,test_r2 = self.val(self.test_dataloader)
+            else:
+                test_mae,test_r2 = best_test,best_test_r2
             
             lr_cur = get_lr(self.optimizer)
-            
-            logging.info(f'Train: {train_loss:.8f}, validation mae: {valid_mae:.8f}, r2: {valid_r2}, test mae: {test_mae:.8f}, r2: {test_r2}, lr: {lr_cur}')
+            epoch_seconds = time.time() - epoch_start
+            memory_msg = ""
+            if torch.cuda.is_available() and self.log_gpu_memory:
+                memory_msg = f", peak_gpu_mem_mb: {torch.cuda.max_memory_allocated() / 1024 / 1024:.1f}"
+            time_msg = f", epoch_seconds: {epoch_seconds:.2f}" if self.log_epoch_time else ""
+            logging.info(f'Train: {train_loss:.8f}, validation mae: {valid_mae:.8f}, r2: {valid_r2}, test mae: {test_mae:.8f}, r2: {test_r2}, lr: {lr_cur}{time_msg}{memory_msg}')
             
 
             self.writer.add_scalar('train_loss', train_loss, epoch)
             self.writer.add_scalar('valid_mae', valid_mae, epoch)
-            self.writer.add_scalar('test_mae', test_mae, epoch)
+            self.writer.add_scalar('valid_r2', valid_r2, epoch)
+            if should_test:
+                self.writer.add_scalar('test_mae', test_mae, epoch)
+                self.writer.add_scalar('test_r2', test_r2, epoch)
+            if self.log_epoch_time:
+                self.writer.add_scalar('epoch_seconds', epoch_seconds, epoch)
+            if torch.cuda.is_available() and self.log_gpu_memory:
+                self.writer.add_scalar('peak_gpu_mem_mb', torch.cuda.max_memory_allocated() / 1024 / 1024, epoch)
             
             if valid_mae < best_valid:
                 best_valid = valid_mae
-                best_test = test_mae
                 best_valid_r2 = valid_r2
-                best_test_r2 = test_r2
+                if should_test:
+                    best_test = test_mae
+                    best_test_r2 = test_r2
                 logging.info('Saving checkpoint...')
                 checkpoint = {'epoch': epoch, 
                                 'model_state_dict': self.model.state_dict(), 
@@ -819,13 +895,8 @@ class SequenceTrainer():
                 xavier_uniform_(p)
         if hasattr(self.config.model,"pretrained_model_path") and self.config.model.pretrained_model_path:
             logging.info(f'[INFO] Load pretrained model {self.config.model.pretrained_model_path}...')
-            pretrained_para_json = f"{self.config.model.pretrained_model_path}/parameters.json"
-            with open(pretrained_para_json,'r') as fr:
-                pretrained_config_dict = json.load(fr)
-            pretrained_config = Box(pretrained_config_dict)
+            pretrained_config = load_config(resolve_config_file(self.config.model.pretrained_model_path))
             ckpt_file = f"{self.config.model.pretrained_model_path}/model/valid_checkpoint.pt"
-            ckpt_inf = torch.load(ckpt_file,map_location="cpu")
-
             '''
             pretrained_model = RXNGClassifier(emb_dim=pretrained_config.model.emb_dim,
                                             gnn_type=pretrained_config.model.gnn_type,
@@ -867,7 +938,12 @@ class SequenceTrainer():
 
 
             
-            pretrained_model.load_state_dict(update_dict_key(ckpt_inf["model_state_dict"]))
+            CheckpointAdapter().load_into_model(
+                pretrained_model,
+                ckpt_file,
+                map_location="cpu",
+                mode="strict",
+            )
             if self.config.model.task == "retrosynthesis":
                 logging.info("[INFO] Use pdt_enocder for retrosynthesis")
                 pretrained_encoder = pretrained_model.pdt_encoder.rxn_graph_encoder
@@ -934,7 +1010,6 @@ class SequenceTrainer():
                                             num_workers=0)
         self.ground_truth_smiles_lst = ["".join([self.vocab_rev[idx] for idx in self.test_dataset[idx].tgt_token_ids[0][:int(self.test_dataset[idx].tgt_lens[0])-1]]) for idx in range(len(self.test_dataset))]
         self.total_step = 0
-        self.accum = 0
         self.losses, self.accs = [], []
         
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.config.others.enable_amp)
@@ -953,9 +1028,12 @@ class SequenceTrainer():
     
     def train(self):
         self.model.train()
-        self.model.zero_grad()
+        self.optimizer.zero_grad()
         losses = []
         accs = []
+        g_norm = 0.0
+        accum_steps = max(1, int(self.config.training.accum))
+        pending_steps = 0
         if self.multi_gpu:
             self.train_dataloader.sampler.set_epoch(self.epoch)
         for step, batch in enumerate(self.train_dataloader):
@@ -971,11 +1049,11 @@ class SequenceTrainer():
                                                 use_cuda=torch.cuda.is_available()) as prof:
                 with torch.cuda.amp.autocast(enabled=self.config.others.enable_amp):
                     loss, acc = self.model(batch)
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(loss / accum_steps).backward()
                 losses.append(loss.item())
                 accs.append(acc.item() * 100)
-                self.accum += 1
-                if self.accum == self.config.training.accum:
+                pending_steps += 1
+                if pending_steps == accum_steps:
                     # Unscales the gradients of optimizer's assigned params in-place
                     self.scaler.unscale_(self.optimizer)
 
@@ -991,8 +1069,8 @@ class SequenceTrainer():
                     self.scheduler.step()
 
                     g_norm = grad_norm(self.model)
-                    self.model.zero_grad()
-                    self.accum = 0
+                    self.optimizer.zero_grad()
+                    pending_steps = 0
             if step % self.config.others.log_step == 0 and step != 0:
                 if self.multi_gpu and dist.get_rank() == 0:
                     logging.info(f"Epoch {self.epoch}: step {step}, loss: {np.mean(losses)}, acc: {np.mean(accs)}, p_norm: {param_norm(self.model)}, g_norm: {g_norm}, lr: {get_lr(self.optimizer)}, time duration: {time.time() - self.start_time: .2f} s")
@@ -1001,14 +1079,14 @@ class SequenceTrainer():
                     logging.info(f"Epoch {self.epoch}: step {step}, loss: {np.mean(losses)}, acc: {np.mean(accs)}, p_norm: {param_norm(self.model)}, g_norm: {g_norm}, lr: {get_lr(self.optimizer)}, time duration: {time.time() - self.start_time: .2f} s")
                     sys.stdout.flush()
         
-        if self.accum != self.config.training.accum:
-
+        if pending_steps > 0:
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.clip_norm)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
-            self.model.zero_grad()
+            g_norm = grad_norm(self.model)
+            self.optimizer.zero_grad()
         if self.multi_gpu and dist.get_rank() == 0:
             logging.info(f"Epoch {self.epoch} / {self.config.training.epoch}, loss: {np.mean(losses)}, acc: {np.mean(accs)}, "
                         f"p_norm: {param_norm(self.model)}, g_norm: {g_norm}, "

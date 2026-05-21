@@ -1,0 +1,70 @@
+[project]
+name = "rxngraphormer"
+dynamic = ["version"]
+description = "Blackwell-ready RXNGraphormer model package"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "lightning>=2.6.0",
+    "numpy>=1.24",
+    "pandas>=2.3.3",
+    "rdkit==2024.3.2",
+    "safetensors>=0.7.0",
+    "scikit-learn>=1.7.2",
+    "tensorboard>=2.20.0",
+    "torch>=2.0",
+    "torch-geometric>=2.3",
+]
+
+[project.optional-dependencies]
+preprocess = [
+    "dgllife==0.3.2; python_version < '3.11'",
+    "joblib>=1.5.2; python_version < '3.11'",
+    "localmapper>=0.1.5; python_version < '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "numpy<2; python_version < '3.11'",
+    "rxnmapper>=0.4.2; python_version < '3.11'",
+]
+sequence = [
+    "opennmt-py==1.2.0",
+]
+all = [
+    "dgllife==0.3.2; python_version < '3.11'",
+    "joblib>=1.5.2; python_version < '3.11'",
+    "localmapper>=0.1.5; python_version < '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "numpy<2; python_version < '3.11'",
+    "rxnmapper>=0.4.2; python_version < '3.11'",
+    "opennmt-py==1.2.0",
+]
+
+[project.scripts]
+rxngraphormer-train = "rxngraphormer.cli:train_main"
+rxngraphormer-train-legacy = "rxngraphormer.cli:train_legacy_main"
+rxngraphormer-train-lit = "rxngraphormer.cli:train_lit_main"
+rxngraphormer-eval = "rxngraphormer.cli:eval_main"
+rxngraphormer-eval-legacy = "rxngraphormer.cli:eval_legacy_main"
+rxngraphormer-predict = "rxngraphormer.cli:predict_main"
+rxngraphormer-preprocess = "rxngraphormer.cli:preprocess_main"
+
+[tool.uv]
+index-url = "https://mirrors.zju.edu.cn/pypi/web/simple"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.2",
+    "ruff>=0.14.5",
+]
+notebook = [
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rxngraphormer"]

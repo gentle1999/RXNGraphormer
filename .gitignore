@@ -170,14 +170,67 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# Temporary folder
+# Local Python/runtime selectors
+.python-version
+
+# Development-only environment overlays.
+# Only envs/README.md and the supported preprocessing environment manifest are tracked.
+envs/*
+!envs/README.md
+!envs/preprocess/
+!envs/preprocess/pyproject.toml
+
+# Development/test training configs.
+# Keep only the supported example and reproduction TOML configs.
+config_toml/**
+!config_toml/
+!config_toml/buchwald_hartwig_parameters.toml
+!config_toml/bh_scratch_reproduce.toml
+
+# Development/experiment scripts.
+# Keep only stable operational utilities used by supported environment docs.
+scripts/**
+!scripts/
+!scripts/rxngraphormer_pipeline.sh
+!scripts/reproduce/
+!scripts/reproduce/check_environment.py
+!scripts/reproduce/figshare_assets.py
+
+# Development/experiment docs.
+# Keep only supported environment documentation.
+docs/**
+!docs/
+!docs/environments.md
+!docs/model_engineering_plan.md
+
+# Temporary and run output folders
 tmp/
-save/*
+temp/
+.tmp/
+save/
+experiments/
+reports/
+rxn_emb_tmp/
+runs/
+lightning_logs/
+wandb/
 
-# Model files
-model_path/*/
+# Training/checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+events.out.tfevents*
 
-# data files
-dataset/*/
-dataset/*.csv
+# Model/checkpoint artifacts. Existing tracked docs remain tracked.
+model_path/**
+
+# Dataset artifacts. Existing tracked docs remain tracked.
+dataset/**
+
+# Notebook/generated media and checkpoints
 notebook/*.png
+notebook/**/*.png
+notebook/.ipynb_checkpoints/
+notebook/**/.ipynb_checkpoints/

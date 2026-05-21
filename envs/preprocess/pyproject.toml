@@ -1,0 +1,20 @@
+[project]
+name = "rxngraphormer-preprocess-profile"
+version = "0.1.0"
+description = "Preprocessing environment wrapper for generating RXNGraphormer datasets"
+requires-python = ">=3.10"
+dependencies = [
+    "rxngraphormer[preprocess]",
+]
+
+[tool.uv]
+index-url = "https://mirrors.zju.edu.cn/pypi/web/simple"
+required-environments = "sys_platform == 'linux' and platform_machine == 'x86_64'"
+
+[tool.uv.sources]
+rxngraphormer = { path = "../..", editable = true }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]

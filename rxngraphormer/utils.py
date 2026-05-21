@@ -5,7 +5,7 @@ import logging
 import os,sys
 import math,torch,random
 import numpy as np
-from box import Box
+from rxngraphormer.config import Box
 import torch.nn.functional as F
 from rdkit.Chem import rdChemReactions
 from .data import ATOM_DICT,ATOM_FEAT_DIMS,gen_onehot
@@ -48,6 +48,18 @@ def get_lr(optimizer):
         lr_lst.append(str(round(param_group["lr"],8)))
     return ",".join(lr_lst)
 
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    return bool(value)
+
+
 def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -56,12 +68,11 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-def get_seq_acc(t1, t2):
-    ## seq of token acc
-    ## seq of token mask
-    both_zero = (t1 == 0) & (t2 == 0)
-    both_one = (t1 == 1) & (t2 == 1)
-    result = both_zero | both_one
+def get_seq_acc(t1, t2, pad_idx=None):
+    ## sequence-level exact match accuracy
+    result = t1 == t2
+    if pad_idx is not None:
+        result = result | ((t1 == pad_idx) & (t2 == pad_idx))
     return result.all(dim=1).float()
 
 def get_random_shuffle_smiles(init_smi, rxn_template="[C,N,O:1]-[*:2]~[*:3]-[*:4]>>[*:4]-[*:2]~[*:3]-[C,N,O:1]", sel_num=2, random_seed=42):
@@ -114,34 +125,54 @@ def gen_truth_false_rxn_smi(rct_pdt_smi__split,rxn_template="[C,N,O:1]-[*:2]~[*:
 
 def pad_feat(feat, batch, num_features):
     device = feat.device
-    batch_size = batch.max() + 1
     batch = batch.to(device)
+    if batch.numel() == 0:
+        raise ValueError("pad_feat requires at least one batch entry")
 
+    batch_size = int(batch.max().item()) + 1
     counts = torch.bincount(batch, minlength=batch_size)
 
-    max_length = counts.max().item()
+    max_length = int(counts.max().item())
 
-    padded_feat = torch.zeros(batch_size, max_length, num_features).to(device)
+    padded_feat = feat.new_zeros((batch_size, max_length, num_features))
 
-    current_idx = torch.zeros(batch_size, dtype=torch.long).to(device)
-    for idx, b in enumerate(batch):
-        padded_feat[b, current_idx[b]] = feat[idx]
-        current_idx[b] += 1
+    first_indices = torch.cumsum(counts, dim=0) - counts
+    positions = torch.arange(batch.numel(), device=device) - first_indices[batch]
+    padded_feat[batch, positions] = feat
 
     return padded_feat
 
-def update_batch_idx(mol_index,device):
+def update_batch_idx(mol_index, device):
+    if torch.is_tensor(mol_index):
+        mol_index = [mol_index]
 
-    mol_tensors = [torch.tensor(m, device=device) for m in mol_index]
+    if len(mol_index) == 0:
+        raise ValueError("update_batch_idx requires at least one molecule index block")
 
-    max_values = torch.tensor([torch.max(m).item() for m in mol_tensors], device=device)
-    offsets = torch.cumsum(max_values + 1, dim=0) - (max_values + 1)
+    first_block = mol_index[0]
+    if not torch.is_tensor(first_block) and not isinstance(first_block, (list, tuple, np.ndarray)):
+        mol_index = [mol_index]
 
-    batch_mol_index = torch.cat([m + offset for m, offset in zip(mol_tensors, offsets)])
-    batch_sizes = max_values + 1
-    batch_ = torch.cat([torch.full((size,), i, dtype=torch.long, device=device) for i, size in enumerate(batch_sizes)])
+    mol_tensors = [torch.as_tensor(m, dtype=torch.long, device=device).view(-1) for m in mol_index]
+    atom_counts = torch.tensor([m.numel() for m in mol_tensors], dtype=torch.long, device=device)
+    if torch.any(atom_counts == 0):
+        raise ValueError("update_batch_idx requires every molecule index block to be non-empty")
 
-    return batch_mol_index, batch_
+    max_values = torch.stack([m.max() for m in mol_tensors])
+    mol_counts = max_values + 1
+    offsets = torch.cumsum(mol_counts, dim=0) - mol_counts
+
+    graph_ids_per_atom = torch.repeat_interleave(
+        torch.arange(len(mol_tensors), dtype=torch.long, device=device),
+        atom_counts,
+    )
+    batch_mol_index = torch.cat(mol_tensors) + offsets[graph_ids_per_atom]
+    batch = torch.repeat_interleave(
+        torch.arange(len(mol_tensors), dtype=torch.long, device=device),
+        mol_counts,
+    )
+
+    return batch_mol_index, batch
 
 def get_sin_encodings(rel_pos_buckets, model_dim):
     pe = torch.zeros(rel_pos_buckets + 1, model_dim)
@@ -159,8 +190,11 @@ def scaled_dot_product_attention(query, key, value, query_mask=None, key_mask=No
     if query_mask is not None and key_mask is not None:
         mask = torch.bmm(query_mask.unsqueeze(-1), key_mask.unsqueeze(1))
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -float("inf"))
+        valid_mask = mask.to(dtype=torch.bool, device=scores.device)
+        scores = scores.masked_fill(~valid_mask, torch.finfo(scores.dtype).min)
     weights = F.softmax(scores, dim=-1)
+    if mask is not None:
+        weights = weights.masked_fill(~valid_mask, 0.0)
     return torch.bmm(weights, value)
 
 def index_scatter(sub_data, all_data, index):
@@ -353,14 +387,15 @@ def add_empty_node_and_edge(batch_data):
                     0, ## Total Num Hs
                     0, ## RS Tag
                     ]
-    oh_empty_node = torch.from_numpy(gen_onehot(empty_node,ATOM_FEAT_DIMS)).unsqueeze(0).long().to(batch_data.x_oh.device)
-    oh_empty_edge = torch.zeros(1,batch_data.edge_oh_attr.shape[1]).long().to(batch_data.x_oh.device)
-    a_graphs_empty = torch.zeros(1,batch_data.a_graphs.shape[1]).long().to(batch_data.x_oh.device)
-    b_graphs_empty = torch.zeros(1,batch_data.b_graphs.shape[1]).long().to(batch_data.x_oh.device)
+    oh_empty_node = batch_data.x_oh.new_tensor(gen_onehot(empty_node, ATOM_FEAT_DIMS)).unsqueeze(0)
+    oh_empty_edge = batch_data.edge_oh_attr.new_zeros((1, batch_data.edge_oh_attr.shape[1]))
+    a_graphs_empty = batch_data.a_graphs.new_zeros((1, batch_data.a_graphs.shape[1]))
+    b_graphs_empty = batch_data.b_graphs.new_zeros((1, batch_data.b_graphs.shape[1]))
 
     x_oh_merge_ = torch.cat([oh_empty_node, batch_data.x_oh], dim=0)
-    batch_data.edge_oh_attr[:,:2] = batch_data.edge_oh_attr[:,:2].clone() + 1 
-    edge_oh_attr_merge_ = torch.cat([oh_empty_edge, batch_data.edge_oh_attr], dim=0)
+    shifted_edge_oh_attr = batch_data.edge_oh_attr.clone()
+    shifted_edge_oh_attr[:, :2] = shifted_edge_oh_attr[:, :2] + 1
+    edge_oh_attr_merge_ = torch.cat([oh_empty_edge, shifted_edge_oh_attr], dim=0)
     a_graphs_merge_ = torch.cat([a_graphs_empty, batch_data.a_graphs+1], dim=0)
     b_graphs_merge_ = torch.cat([b_graphs_empty, batch_data.b_graphs+1], dim=0)
     
@@ -383,7 +418,7 @@ def add_empty_node_and_edge(batch_data):
     return batch_data
 
 def add_dense_empty_node_edge(batch_data):
-    empty_node = torch.tensor([[ATOM_DICT.get("*", ATOM_DICT["unk"]),
+    empty_node = batch_data.x.new_tensor([[ATOM_DICT.get("*", ATOM_DICT["unk"]),
                     0, ## Degree
                     0, ## Formal Charge
                     0, ## Hybridization
@@ -392,11 +427,11 @@ def add_dense_empty_node_edge(batch_data):
                     0, ## Total Valence
                     0, ## Total Num Hs
                     0, ## RS Tag
-                    ]]).to(batch_data.x.device)
-    empty_edge = torch.zeros(1,batch_data.edge_attr.shape[1]).long().to(batch_data.x.device)
+                    ]])
+    empty_edge = batch_data.edge_attr.new_zeros((1, batch_data.edge_attr.shape[1]))
     x_merge_ = torch.cat([empty_node, batch_data.x], dim=0)
     edge_merge_ = torch.cat([empty_edge, batch_data.edge_attr], dim=0)
-    edge_index_ = torch.cat([torch.zeros(2,1).long().to(batch_data.x.device), batch_data.edge_index+1], dim=1)
+    edge_index_ = torch.cat([batch_data.edge_index.new_zeros((2, 1)), batch_data.edge_index+1], dim=1)
     # batch_data.batch = torch.cat([torch.tensor([-1]).long().to(batch_data.x.device), batch_data.batch], dim=0) + 1
     
     batch_data.mol_index = [[0]] + batch_data.mol_index

@@ -1,72 +1,32 @@
-import json,torch,os,shutil
-from box import Box
+import os
+import tempfile
+
+import torch
+from rxngraphormer.config import load_config, resolve_config_file
 from tqdm import tqdm
-from .model import RXNGClassifier,RXNGRegressor,RXNGraphormer
-from .utils import update_dict_key,canonical_smiles,align_config
+from .checkpointing import CheckpointAdapter
+from .model import masked_sequence_mean
+from .model_factory import build_classification_model, build_regression_model
+from .reaction import canonicalize_reaction_side, split_reaction_smiles
+from .predictor import RXNGraphormerPredictor
+from .utils import canonical_smiles
 from .data import MultiRXNDataset,PairDataset,pair_collate_fn,single_collate_fn
 from torch.nn.init import xavier_uniform_
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class RXNEMB():
     def __init__(self,pretrained_model_path,random_init=False,model_type="classifier"):
-        pretrained_para_json = f"{pretrained_model_path}/parameters.json"
-        with open(pretrained_para_json,'r') as fr:
-            pretrained_config_dict = json.load(fr)
-        pretrained_config = Box(pretrained_config_dict)
+        pretrained_config = load_config(resolve_config_file(pretrained_model_path))
         ckpt_file = f"{pretrained_model_path}/model/valid_checkpoint.pt"
-        ckpt_inf = torch.load(ckpt_file,map_location=device)
         if model_type == "classifier":
-            input_param = {"emb_dim":pretrained_config.model.emb_dim,
-                            "gnn_type":pretrained_config.model.gnn_type,
-                            "gnn_aggr":pretrained_config.model.gnn_aggr,
-                            "gnum_layer":pretrained_config.model.gnn_num_layer,
-                            "node_readout":pretrained_config.model.node_readout,
-                            "num_heads":pretrained_config.model.num_heads,
-                            "JK":pretrained_config.model.gnn_jk,
-                            "graph_pooling":pretrained_config.model.graph_pooling,
-                            "tnum_layer":pretrained_config.model.trans_num_layer,
-                            "trans_readout":pretrained_config.model.trans_readout,
-                            "onum_layer":pretrained_config.model.output_num_layer,
-                            "drop_ratio":pretrained_config.model.drop_ratio,
-                            "output_size":2,
-                            "split_process":True,
-                            "split_merge_method":pretrained_config.model.split_merge_method,
-                            "output_act_func":pretrained_config.model.output_act_func}
-            rxng = RXNGraphormer("classification",align_config(input_param,"classifier"),"")
-            model = rxng.get_model()
-
-
+            model = build_classification_model(pretrained_config)
         elif model_type == "regressor":
-            
-            input_param = {"emb_dim":pretrained_config.model.emb_dim,
-                            "gnn_type":pretrained_config.model.gnn_type,
-                            "gnn_aggr":pretrained_config.model.gnn_aggr,
-                            "gnum_layer":pretrained_config.model.gnn_num_layer,
-                            "node_readout":pretrained_config.model.node_readout,
-                            "num_heads":pretrained_config.model.num_heads,
-                            "JK":pretrained_config.model.gnn_jk,
-                            "graph_pooling":pretrained_config.model.graph_pooling,
-                            "tnum_layer":pretrained_config.model.trans_num_layer,
-                            "trans_readout":pretrained_config.model.trans_readout,
-                            "onum_layer":pretrained_config.model.output_num_layer,
-                            "drop_ratio":pretrained_config.model.drop_ratio,
-                            "output_size":1,
-                            "output_norm":eval(pretrained_config.model.output_norm),
-                            "split_process":True,
-                            "split_merge_method":pretrained_config.model.split_merge_method,
-                            "output_act_func":pretrained_config.model.output_act_func,
-                            "rct_batch_norm":eval(pretrained_config.model.rct_batch_norm),
-                            "pdt_batch_norm":eval(pretrained_config.model.pdt_batch_norm),
-                            "use_mid_inf":pretrained_config.model.use_mid_inf,
-                            "mid_iteract_method":pretrained_config.model.mid_iteract_method,
-                            "mid_batch_norm":eval(pretrained_config.model.mid_batch_norm),
-                            "mid_layer_num":pretrained_config.model.mid_layer_num}
-            
-            rxng = RXNGraphormer("regression",align_config(input_param,"regressor"),"")
-            model = rxng.get_model()
+            model = build_regression_model(pretrained_config)
+        else:
+            raise ValueError("model_type must be either 'classifier' or 'regressor'")
 
         if not random_init:
-            model.load_state_dict(update_dict_key(ckpt_inf["model_state_dict"]))
+            CheckpointAdapter().load_into_model(model, ckpt_file, map_location=device, mode="strict")
         else:
             print("[INFO] Randomly initialize model parameters")
             for p in model.parameters():
@@ -94,8 +54,10 @@ class RXNEMB():
                 rct_rxn_transf_emb = rct_padded_memory_bank.transpose(0,1)
                 pdt_rxn_transf_emb = pdt_padded_memory_bank.transpose(0,1)
                 if self.model.trans_readout == 'mean':
-                    rct_rxn_transf_emb_merg = rct_rxn_transf_emb.mean(dim=1)
-                    pdt_rxn_transf_emb_merg = pdt_rxn_transf_emb.mean(dim=1)
+                    rct_rxn_transf_emb_merg = masked_sequence_mean(rct_rxn_transf_emb, rct_memory_lengths)
+                    pdt_rxn_transf_emb_merg = masked_sequence_mean(pdt_rxn_transf_emb, pdt_memory_lengths)
+                else:
+                    raise NotImplementedError(f"Unsupported trans_readout: {self.model.trans_readout}")
                 diff_emb = torch.abs(rct_rxn_transf_emb_merg - pdt_rxn_transf_emb_merg)
                 if self.model.split_merge_method == "all":
                     rxn_emb = torch.cat([rct_rxn_transf_emb_merg,pdt_rxn_transf_emb_merg,diff_emb],dim=-1)
@@ -157,16 +119,23 @@ class RXNEMB():
     
     def gen_rxn_emb(self,rxn_smiles_lst,batch_size=128):
         assert len(rxn_smiles_lst) >= 2, "rxn_smiles_lst must contain at least 2 reactions"
-        rct_smi_lst = [f'{canonical_smiles(smi.split(">>")[0])},0' for smi in rxn_smiles_lst]
-        pdt_smi_lst = [f'{canonical_smiles(smi.split(">>")[1])},0' for smi in rxn_smiles_lst]
-        os.makedirs("./rxn_emb_tmp/",exist_ok=True)
-        with open("./rxn_emb_tmp/rct_smiles_0.csv","w") as fw:
-            fw.writelines("\n".join(rct_smi_lst))
-        with open("./rxn_emb_tmp/pdt_smiles_0.csv","w") as fw:
-            fw.writelines("\n".join(pdt_smi_lst))
-        rxn_emb = self.gen_rxn_emb_from_dataset(root="./rxn_emb_tmp",rct_name_regrex="rct_smiles_0.csv",pdt_name_regrex="pdt_smiles_0.csv",batch_size=batch_size)
-        shutil.rmtree("./rxn_emb_tmp")
-        return rxn_emb
+        rct_smi_lst = []
+        pdt_smi_lst = []
+        for smi in rxn_smiles_lst:
+            reactant, product = split_reaction_smiles(smi)
+            rct_smi_lst.append(f"{canonicalize_reaction_side(reactant)},0")
+            pdt_smi_lst.append(f"{canonicalize_reaction_side(product)},0")
+        with tempfile.TemporaryDirectory(prefix="rxngraphormer_rxn_emb_") as tmp_dir:
+            with open(os.path.join(tmp_dir, "rct_smiles_0.csv"), "w") as fw:
+                fw.writelines("\n".join(rct_smi_lst))
+            with open(os.path.join(tmp_dir, "pdt_smiles_0.csv"), "w") as fw:
+                fw.writelines("\n".join(pdt_smi_lst))
+            return self.gen_rxn_emb_from_dataset(
+                root=tmp_dir,
+                rct_name_regrex="rct_smiles_0.csv",
+                pdt_name_regrex="pdt_smiles_0.csv",
+                batch_size=batch_size,
+            )
     
     def gen_mult_mol_emb(self,mult_mol_smiles_lst,mol_type="rct",batch_size=128):
         
@@ -184,96 +153,71 @@ class RXNEMB():
         assert mol_type in ["rct","pdt"], "mol_type must be either 'rct' or 'pdt'"
         assert len(mol_smiles_lst) >= 2, "mol_smiles_lst must contain at least 2 molecule"
         mol_smi_lst = [f'{canonical_smiles(smi)},0' for smi in mol_smiles_lst]
-        os.makedirs("./mol_emb_tmp/",exist_ok=True)
-        with open(f"./mol_emb_tmp/{mol_type}_smiles_0.csv","w") as fw:
-            fw.writelines("\n".join(mol_smi_lst))
-        mol_emb = self.gen_mol_emb_from_dataset(root="./mol_emb_tmp",name_regrex=f"{mol_type}_smiles_0.csv",mol_type=mol_type,batch_size=batch_size)
-        shutil.rmtree("./mol_emb_tmp")
-        return mol_emb
+        name_regrex = f"{mol_type}_smiles_0.csv"
+        with tempfile.TemporaryDirectory(prefix="rxngraphormer_mol_emb_") as tmp_dir:
+            with open(os.path.join(tmp_dir, name_regrex), "w") as fw:
+                fw.writelines("\n".join(mol_smi_lst))
+            return self.gen_mol_emb_from_dataset(
+                root=tmp_dir,
+                name_regrex=name_regrex,
+                mol_type=mol_type,
+                batch_size=batch_size,
+            )
     
     def gen_half_rxn_mol_emb(self,half_rxn_smiles_lst,mol_type="rct",batch_size=128):
         assert mol_type in ["rct","pdt"], "mol_type must be either 'rct' or 'pdt'"
         assert len(half_rxn_smiles_lst) >= 2, "half_rxn_smiles_lst must contain at least 2 half reactions"
         half_rxn_smi_lst = [f'{canonical_smiles(smi)},0' for smi in half_rxn_smiles_lst]
-        os.makedirs("./half_rxn_emb_tmp/",exist_ok=True)
-        with open(f"./half_rxn_emb_tmp/{mol_type}_smiles_0.csv","w") as fw:
-            fw.writelines("\n".join(half_rxn_smi_lst))
-        half_rxn_emb = self.gen_half_rxn_mol_emb_from_dataset(root="./half_rxn_emb_tmp",name_regrex=f"{mol_type}_smiles_0.csv",mol_type=mol_type,batch_size=batch_size)
-        shutil.rmtree("./half_rxn_emb_tmp")
-        return half_rxn_emb
+        name_regrex = f"{mol_type}_smiles_0.csv"
+        with tempfile.TemporaryDirectory(prefix="rxngraphormer_half_rxn_emb_") as tmp_dir:
+            with open(os.path.join(tmp_dir, name_regrex), "w") as fw:
+                fw.writelines("\n".join(half_rxn_smi_lst))
+            return self.gen_half_rxn_mol_emb_from_dataset(
+                root=tmp_dir,
+                name_regrex=name_regrex,
+                mol_type=mol_type,
+                batch_size=batch_size,
+            )
 
 class RXNClassifier():
     def __init__(self,pretrained_model_path,random_init=False):
-        pretrained_para_json = f"{pretrained_model_path}/parameters.json"
-        with open(pretrained_para_json,'r') as fr:
-            pretrained_config_dict = json.load(fr)
-        pretrained_config = Box(pretrained_config_dict)
-        ckpt_file = f"{pretrained_model_path}/model/valid_checkpoint.pt"
-        ckpt_inf = torch.load(ckpt_file,map_location=device)
-
-        input_param = {"emb_dim":pretrained_config.model.emb_dim,
-                        "gnn_type":pretrained_config.model.gnn_type,
-                        "gnn_aggr":pretrained_config.model.gnn_aggr,
-                        "gnum_layer":pretrained_config.model.gnn_num_layer,
-                        "node_readout":pretrained_config.model.node_readout,
-                        "num_heads":pretrained_config.model.num_heads,
-                        "JK":pretrained_config.model.gnn_jk,
-                        "graph_pooling":pretrained_config.model.graph_pooling,
-                        "tnum_layer":pretrained_config.model.trans_num_layer,
-                        "trans_readout":pretrained_config.model.trans_readout,
-                        "onum_layer":pretrained_config.model.output_num_layer,
-                        "drop_ratio":pretrained_config.model.drop_ratio,
-                        "output_size":2,
-                        "split_process":True,
-                        "split_merge_method":pretrained_config.model.split_merge_method,
-                        "output_act_func":pretrained_config.model.output_act_func}
-        rxng = RXNGraphormer("classification",align_config(input_param,"classifier"),"")
-        model = rxng.get_model()
-        
-        if not random_init:
-            model.load_state_dict(update_dict_key(ckpt_inf["model_state_dict"]))
-        else:
-            print("[INFO] Randomly initialize model parameters")
-            for p in model.parameters():
-                if p.dim() > 1 and p.requires_grad:
-                    xavier_uniform_(p)
-            
-        model.to(device)
-        # model.eval()
-        self.model = model
+        self.predictor = RXNGraphormerPredictor(
+            pretrained_model_path,
+            task="classification",
+            device=device,
+            random_init=random_init,
+        )
+        self.model = self.predictor.model
     
     def rxn_pred(self,rxn_smiles_lst,batch_size=128):
         assert len(rxn_smiles_lst) >= 2, "rxn_smiles_lst must contain at least 2 reactions"
-        rct_smi_lst = [f'{canonical_smiles(smi.split(">>")[0])},0' for smi in rxn_smiles_lst]
-        pdt_smi_lst = [f'{canonical_smiles(smi.split(">>")[1])},0' for smi in rxn_smiles_lst]
-        os.makedirs("./rxn_emb_tmp/",exist_ok=True)
-        with open("./rxn_emb_tmp/rct_smiles_0.csv","w") as fw:
-            fw.writelines("\n".join(rct_smi_lst))
-        with open("./rxn_emb_tmp/pdt_smiles_0.csv","w") as fw:
-            fw.writelines("\n".join(pdt_smi_lst))
-        rxn_preds,rxn_confidences = self.rxn_pred_from_dataset(root="./rxn_emb_tmp",rct_name_regrex="rct_smiles_0.csv",pdt_name_regrex="pdt_smiles_0.csv",batch_size=batch_size)
-        shutil.rmtree("./rxn_emb_tmp")
-        return rxn_preds,rxn_confidences
+        rct_smi_lst = []
+        pdt_smi_lst = []
+        for smi in rxn_smiles_lst:
+            reactant, product = split_reaction_smiles(smi)
+            rct_smi_lst.append(f"{canonicalize_reaction_side(reactant)},0")
+            pdt_smi_lst.append(f"{canonicalize_reaction_side(product)},0")
+        with tempfile.TemporaryDirectory(prefix="rxngraphormer_rxn_pred_") as tmp_dir:
+            with open(os.path.join(tmp_dir, "rct_smiles_0.csv"), "w") as fw:
+                fw.writelines("\n".join(rct_smi_lst))
+            with open(os.path.join(tmp_dir, "pdt_smiles_0.csv"), "w") as fw:
+                fw.writelines("\n".join(pdt_smi_lst))
+            return self.rxn_pred_from_dataset(
+                root=tmp_dir,
+                rct_name_regrex="rct_smiles_0.csv",
+                pdt_name_regrex="pdt_smiles_0.csv",
+                batch_size=batch_size,
+            )
     
     def rxn_pred_from_dataset(self,root,
                                  rct_name_regrex,
                                  pdt_name_regrex,
                                  batch_size=128):
-        rct_dataset = MultiRXNDataset(root=root, name_regrex=rct_name_regrex)
-        pdt_dataset = MultiRXNDataset(root=root, name_regrex=pdt_name_regrex)
-        pair_dataset = PairDataset(rct_dataset,pdt_dataset)
-        pair_dataloader = torch.utils.data.DataLoader(pair_dataset, batch_size=batch_size, shuffle=False,collate_fn=pair_collate_fn)
-        all_rxn_pred = []
-        all_rxn_confidence = []
         print("[INFO] Predict whether the reaction is real...")
-        with torch.no_grad():
-            for data in tqdm(pair_dataloader):
-                rct_data,pdt_data = data
-                rct_data.to(device)
-                pdt_data.to(device)
-                out = self.model([rct_data,pdt_data])
-                preds = out.argmax(1)
-                confidence = out.max(1).values
-                all_rxn_pred.append(preds.detach().cpu())
-                all_rxn_confidence.append(confidence.detach().cpu())
-        return torch.cat(all_rxn_pred,dim=0),torch.cat(all_rxn_confidence,dim=0)
+        result = self.predictor.predict_from_dataset(
+            root,
+            rct_name_regrex=rct_name_regrex,
+            pdt_name_regrex=pdt_name_regrex,
+            batch_size=batch_size,
+        )
+        return result.preds, result.confidence

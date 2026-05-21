@@ -1,21 +1,44 @@
 import torch,math,json
-from box import Box
+from rxngraphormer.config import Box
 import numpy as np
 from torch import nn
 from torch_geometric.nn import GlobalAttention
 import torch.nn.functional as F
-from onmt.modules.embeddings import Embeddings
-from onmt.decoders import TransformerDecoder
-from onmt.translate import BeamSearch, GNMTGlobalScorer, GreedySearch
-from onmt.modules.embeddings import PositionalEncoding
-from onmt.modules.position_ffn import PositionwiseFeedForward
-from onmt.utils.misc import sequence_mask
 from .data import calc_batch_graph_distance,NUM_ATOM_TYPE,NUM_DEGRESS_TYPE,\
                    NUM_FORMCHRG_TYPE,NUM_HYBRIDTYPE,NUM_CHIRAL_TYPE,NUM_AROMATIC_NUM,\
                    NUM_VALENCE_TYPE,NUM_Hs_TYPE,NUM_RS_TPYE
 from .utils import pad_feat,update_batch_idx,get_sin_encodings,update_dict_key
 from .layer import GCNConv,GINConv,GATConv,MultiHeadAttention,FeedForward
                    
+_ONMT_SYMBOLS = None
+
+
+def _require_onmt():
+    global _ONMT_SYMBOLS
+    if _ONMT_SYMBOLS is None:
+        try:
+            from onmt.decoders import TransformerDecoder
+            from onmt.modules.embeddings import Embeddings, PositionalEncoding
+            from onmt.modules.position_ffn import PositionwiseFeedForward
+            from onmt.translate import BeamSearch, GNMTGlobalScorer, GreedySearch
+            from onmt.utils.misc import sequence_mask
+        except ImportError as exc:
+            raise ImportError(
+                "OpenNMT is required for sequence_generation models. "
+                "Install the sequence extra with `uv sync --extra sequence`."
+            ) from exc
+        _ONMT_SYMBOLS = {
+            "BeamSearch": BeamSearch,
+            "Embeddings": Embeddings,
+            "GNMTGlobalScorer": GNMTGlobalScorer,
+            "GreedySearch": GreedySearch,
+            "PositionalEncoding": PositionalEncoding,
+            "PositionwiseFeedForward": PositionwiseFeedForward,
+            "TransformerDecoder": TransformerDecoder,
+            "sequence_mask": sequence_mask,
+        }
+    return _ONMT_SYMBOLS
+
 
 class RegressorLayer(nn.Module):
     def __init__(self,hidden_size,output_size,layer_num=3,batch_norm=False,act_func='relu'):
@@ -50,7 +73,7 @@ class ClassifierLayer(nn.Module):
         self.batch_norms = nn.ModuleList([nn.BatchNorm1d(hidden_size) for i in range(layer_num-1)])
         self.projection = nn.Linear(hidden_size, output_size,bias=False)
         
-    def forward(self,x):
+    def logits(self,x):
         if self.batch_norm:
             for layer,batch in zip(self.layers,self.batch_norms):
                 x = self.act_func(batch(layer(x)))
@@ -58,7 +81,10 @@ class ClassifierLayer(nn.Module):
             for layer in self.layers:
                 x = self.act_func(layer(x))
         
-        return F.softmax(self.projection(x), dim=-1)
+        return self.projection(x)
+
+    def forward(self,x):
+        return F.softmax(self.logits(x), dim=-1)
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, hidden_size,intermediate_size,num_heads,hidden_dropout_prob):
@@ -83,10 +109,25 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([TransformerEncoderLayer(hidden_size=hidden_size,intermediate_size=intermediate_size,
                                     num_heads=num_heads,hidden_dropout_prob=hidden_dropout_prob) for _ in range(num_layer)])
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
+        valid_mask = None
+        attention_mask = None
+        if lengths is not None:
+            max_len = x.size(1)
+            valid_mask = torch.arange(max_len, device=x.device).unsqueeze(0) < lengths.to(x.device).unsqueeze(1)
+            attention_mask = valid_mask.unsqueeze(1)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, mask=attention_mask)
+            if valid_mask is not None:
+                x = x * valid_mask.unsqueeze(-1).to(dtype=x.dtype)
         return x
+
+
+def masked_sequence_mean(x, lengths):
+    max_len = x.size(1)
+    mask = torch.arange(max_len, device=x.device).unsqueeze(0) < lengths.to(x.device).unsqueeze(1)
+    denom = lengths.to(device=x.device, dtype=x.dtype).clamp_min(1).unsqueeze(1)
+    return (x * mask.unsqueeze(-1).to(dtype=x.dtype)).sum(dim=1) / denom
     
 class EXTFeatEncoder(nn.Module):
     def __init__(self,input_size,hidden_size,output_size,hidden_layer_num=3,batch_norm=True):
@@ -217,7 +258,9 @@ class RXNGRegressor(torch.nn.Module):
             padded_memory_bank,batch,memory_lengths = self.encoder(data)
             rxn_transf_emb = padded_memory_bank.transpose(0,1)
             if self.trans_readout == 'mean':
-                rxn_transf_emb_merg = rxn_transf_emb.mean(dim=1) #### super para
+                rxn_transf_emb_merg = masked_sequence_mean(rxn_transf_emb, memory_lengths)
+            else:
+                raise NotImplementedError(f"Unsupported trans_readout: {self.trans_readout}")
 
             output = self.decoder(rxn_transf_emb_merg)
 
@@ -229,8 +272,10 @@ class RXNGRegressor(torch.nn.Module):
                 rct_rxn_transf_emb = rct_padded_memory_bank.transpose(0,1)
                 pdt_rxn_transf_emb = pdt_padded_memory_bank.transpose(0,1)
                 if self.trans_readout == 'mean':
-                    rct_rxn_transf_emb_merg = rct_rxn_transf_emb.mean(dim=1) #### super para  shape: (batch_size, emb_dim) eg. 32, 256
-                    pdt_rxn_transf_emb_merg = pdt_rxn_transf_emb.mean(dim=1) #### super para  shape: (batch_size, emb_dim) eg. 32, 256
+                    rct_rxn_transf_emb_merg = masked_sequence_mean(rct_rxn_transf_emb, rct_memory_lengths)
+                    pdt_rxn_transf_emb_merg = masked_sequence_mean(pdt_rxn_transf_emb, pdt_memory_lengths)
+                else:
+                    raise NotImplementedError(f"Unsupported trans_readout: {self.trans_readout}")
 
                 diff_emb = torch.abs(rct_rxn_transf_emb_merg - pdt_rxn_transf_emb_merg)
                 cat_emb = torch.cat([rct_rxn_transf_emb_merg,pdt_rxn_transf_emb_merg,diff_emb],dim=-1)
@@ -251,9 +296,11 @@ class RXNGRegressor(torch.nn.Module):
                 pdt_rxn_transf_emb = pdt_padded_memory_bank.transpose(0,1)
                 mid_rxn_transf_emb = mid_padded_memory_bank.transpose(0,1)
                 if self.trans_readout == 'mean':
-                    rct_rxn_transf_emb_merg = rct_rxn_transf_emb.mean(dim=1)  #### super para  shape: (batch_size, emb_dim) eg. 32, 256
-                    pdt_rxn_transf_emb_merg = pdt_rxn_transf_emb.mean(dim=1)  #### super para  shape: (batch_size, emb_dim) eg. 32, 256
-                    mid_rxn_transf_emb_merg = mid_rxn_transf_emb.mean(dim=1)  #### super para  shape: (batch_size, emb_dim) eg. 32, 256
+                    rct_rxn_transf_emb_merg = masked_sequence_mean(rct_rxn_transf_emb, rct_memory_lengths)
+                    pdt_rxn_transf_emb_merg = masked_sequence_mean(pdt_rxn_transf_emb, pdt_memory_lengths)
+                    mid_rxn_transf_emb_merg = masked_sequence_mean(mid_rxn_transf_emb, mid_memory_lengths)
+                else:
+                    raise NotImplementedError(f"Unsupported trans_readout: {self.trans_readout}")
                 
 
                 diff_emb = torch.abs(rct_rxn_transf_emb_merg - pdt_rxn_transf_emb_merg)                     ## shape: (batch_size, emb_dim) eg. 32, 256
@@ -321,13 +368,15 @@ class RXNGClassifier(torch.nn.Module):
             elif self.split_merge_method == "rct_pdt":
                 self.decoder = ClassifierLayer(hidden_size=self.emb_dim*2,output_size=output_size,layer_num=onum_layer,act_func=self.output_act_func) # *2 -> rct, pdt
         
-    def forward(self,data):
+    def logits(self,data):
         if not self.split_process:
             padded_memory_bank,batch,memory_lengths = self.encoder(data)
             rxn_transf_emb = padded_memory_bank.transpose(0,1)
             if self.trans_readout == 'mean':
-                rxn_transf_emb_merg = rxn_transf_emb.mean(dim=1) #### super para
-            output = self.decoder(rxn_transf_emb_merg)
+                rxn_transf_emb_merg = masked_sequence_mean(rxn_transf_emb, memory_lengths)
+            else:
+                raise NotImplementedError(f"Unsupported trans_readout: {self.trans_readout}")
+            output = self.decoder.logits(rxn_transf_emb_merg)
         else:
             rct_data,pdt_data = data
             rct_padded_memory_bank,rct_batch,rct_memory_lengths = self.rct_encoder(rct_data)
@@ -335,19 +384,24 @@ class RXNGClassifier(torch.nn.Module):
             rct_rxn_transf_emb = rct_padded_memory_bank.transpose(0,1)
             pdt_rxn_transf_emb = pdt_padded_memory_bank.transpose(0,1)
             if self.trans_readout == 'mean':
-                rct_rxn_transf_emb_merg = rct_rxn_transf_emb.mean(dim=1) #### super para
-                pdt_rxn_transf_emb_merg = pdt_rxn_transf_emb.mean(dim=1) #### super para
+                rct_rxn_transf_emb_merg = masked_sequence_mean(rct_rxn_transf_emb, rct_memory_lengths)
+                pdt_rxn_transf_emb_merg = masked_sequence_mean(pdt_rxn_transf_emb, pdt_memory_lengths)
+            else:
+                raise NotImplementedError(f"Unsupported trans_readout: {self.trans_readout}")
             
             diff_emb = torch.abs(rct_rxn_transf_emb_merg - pdt_rxn_transf_emb_merg)
             if self.split_merge_method == "all":
                 cat_emb = torch.cat([rct_rxn_transf_emb_merg,pdt_rxn_transf_emb_merg,diff_emb],dim=-1)
-                output = self.decoder(cat_emb)
+                output = self.decoder.logits(cat_emb)
             elif self.split_merge_method == "only_diff":
-                output = self.decoder(diff_emb)
+                output = self.decoder.logits(diff_emb)
             elif self.split_merge_method == "rct_pdt":
                 rct_pdt_cat_emb = torch.cat([rct_rxn_transf_emb_merg,pdt_rxn_transf_emb_merg],dim=-1)
-                output = self.decoder(rct_pdt_cat_emb)
+                output = self.decoder.logits(rct_pdt_cat_emb)
         return output
+
+    def forward(self,data):
+        return F.softmax(self.logits(data), dim=-1)
 
 class RXNGraphEncoder(nn.Module):
     def __init__(self, gnum_layer, emb_dim, gnn_aggr="add", bond_feat_red="mean", gnn_type='gcn', JK="last", drop_ratio=0.0, node_readout="sum"):
@@ -420,9 +474,9 @@ class RXNGraphEncoder(nn.Module):
             h = self.batch_norms[layer](h)
             if layer == self.gnum_layer - 1:
                 #remove relu for the last layer
-                h = F.dropout(h, self.drop_ratio, training=True)
+                h = F.dropout(h, self.drop_ratio, training=self.training)
             else:
-                h = F.dropout(F.relu(h), self.drop_ratio, training=True)
+                h = F.dropout(F.relu(h), self.drop_ratio, training=self.training)
             h_list.append(h)
         if self.JK == 'last':
             node_representation = h_list[-1]
@@ -496,7 +550,7 @@ class RXNGEncoder(torch.nn.Module):
             memory_lengths = torch.bincount(batch).long().to(device=node_representation.device)
             rxn_representation = self.pool(node_representation,mol_index)  ## node_representation is equal to hatom
             padded_feat = pad_feat(rxn_representation,batch,self.emb_dim)
-            rxn_transf_emb = self.t_encoder(padded_feat)
+            rxn_transf_emb = self.t_encoder(padded_feat, memory_lengths)
             padded_memory_bank = rxn_transf_emb.transpose(1,0)
 
         elif self.graph_pooling == "attentionxl":  ## TODO name it 
@@ -526,6 +580,10 @@ class RXNGEncoder(torch.nn.Module):
 
         return padded_memory_bank,batch,memory_lengths
 
+def _decoder_src_placeholder(memory_lengths):
+    max_length = int(memory_lengths.max().item())
+    return memory_lengths.new_zeros(max_length)
+
 class SeqDecoder(nn.Module):
     def __init__(self, word_vec_size, vocab,decoder_num_layers,decoder_hidden_size,
                  decoder_attn_heads,decoder_filter_size,max_relative_positions,
@@ -534,19 +592,20 @@ class SeqDecoder(nn.Module):
                  aan_useffn=False,full_context_alignment=False,alignment_layer=-3,
                  alignment_heads=0,dropout=0.0):
         super().__init__()
+        onmt = _require_onmt()
         self.vocab = vocab
         self.pad_token = pad_token
         self.sos_token = sos_token
         self.eos_token = eos_token
         self.word_vocab_size = len(self.vocab)
         self.word_padding_idx = self.vocab[self.pad_token]
-        self.decoder_embeddings = Embeddings(
+        self.decoder_embeddings = onmt["Embeddings"](
                 word_vec_size=word_vec_size,
                 word_vocab_size=self.word_vocab_size,
                 word_padding_idx=self.word_padding_idx,
                 position_encoding=position_encoding,
                 dropout=dropout)
-        self.tdecoder = TransformerDecoder(
+        self.tdecoder = onmt["TransformerDecoder"](
             num_layers=decoder_num_layers,
             d_model=decoder_hidden_size,
             heads=decoder_attn_heads,
@@ -568,7 +627,7 @@ class SeqDecoder(nn.Module):
         #memory_lengths = torch.bincount(batch).long().to(device=rxn_emb_enc.device)
         # padded_memory_bank = rxn_emb_enc.transpose(1,0)
         # print(f"padded_memory_bank.shape: {padded_memory_bank.shape}, memory_lengths.shape: {memory_lengths.shape}")
-        self.tdecoder.state["src"] = torch.zeros(max(memory_lengths))
+        self.tdecoder.state["src"] = _decoder_src_placeholder(memory_lengths)
         
         dec_in = tgt_token_ids[:, :-1] ## pop last, insert SOS for decoder input
         m = nn.ConstantPad1d((1, 0), self.vocab[self.sos_token])
@@ -601,12 +660,13 @@ class G2STransformer(nn.Module):
         dec_outs, predictions = self.tdecoder(padded_memory_bank,data.tgt_token_ids,memory_lengths)
         return dec_outs,predictions
     def infer(self,data,batch_size,beam_size,n_best=10,temperature=1.0,min_length=0,max_length=512):
+        onmt = _require_onmt()
         padded_memory_bank,batch,memory_lengths = self.tencoder(data)
         #memory_lengths = torch.bincount(batch).long().to(device=rxn_emb_enc.device)
         # padded_memory_bank = rxn_emb_enc.transpose(1,0)
-        self.tdecoder.tdecoder.state["src"] = torch.zeros(max(memory_lengths))
+        self.tdecoder.tdecoder.state["src"] = _decoder_src_placeholder(memory_lengths)
         if beam_size == 1:
-            decode_strategy = GreedySearch(pad=self.vocab["_PAD"],
+            decode_strategy = onmt["GreedySearch"](pad=self.vocab["_PAD"],
                                             bos=self.vocab["_SOS"],
                                             eos=self.vocab["_EOS"],
                                             batch_size=batch_size,
@@ -618,8 +678,8 @@ class G2STransformer(nn.Module):
                                             sampling_temp=0.0,
                                             keep_topk=1)
         else:
-            global_scorer = GNMTGlobalScorer(alpha=0.0,beta=0.0,length_penalty="none",coverage_penalty="none")
-            decode_strategy = BeamSearch(
+            global_scorer = onmt["GNMTGlobalScorer"](alpha=0.0,beta=0.0,length_penalty="none",coverage_penalty="none")
+            decode_strategy = onmt["BeamSearch"](
                 beam_size=beam_size,
                 batch_size=batch_size,
                 pad=self.vocab["_PAD"],
@@ -874,6 +934,7 @@ class SALayerXL(nn.Module):
 
     def __init__(self, d_model, heads, d_ff, dropout, attention_dropout, rel_pos_buckets, u, v, rel_pos="emb_only"):
         super().__init__()
+        onmt = _require_onmt()
 
         self.self_attn = MultiHeadedRelAttention(
             heads, d_model, dropout=attention_dropout,
@@ -882,7 +943,7 @@ class SALayerXL(nn.Module):
             v=v,
             rel_pos=rel_pos
         )
-        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.feed_forward = onmt["PositionwiseFeedForward"](d_model, d_ff, dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
 
@@ -908,6 +969,7 @@ class AttnEncoderXL(nn.Module):
     def __init__(self, num_layers, d_model, heads, d_ff, dropout, attention_dropout, rel_pos_buckets,
                  enc_pos_encoding="transformer",rel_pos="emb_only",encoder_emb_scale="sqrt"):
         super().__init__()
+        onmt = _require_onmt()
         #self.args = args
         """
         self.num_layers = args.attn_enc_num_layers
@@ -929,7 +991,7 @@ class AttnEncoderXL(nn.Module):
         self.encoder_pe = None
         self.encoder_emb_scale = encoder_emb_scale
         if self.enc_pos_encoding == "transformer":
-            self.encoder_pe = PositionalEncoding(
+            self.encoder_pe = onmt["PositionalEncoding"](
                 dropout=self.dropout,                       
                 dim=self.d_model,
                 max_len=1024        # temporary hard-code. Seems that onmt fix the denominator as 10000.0
@@ -967,7 +1029,7 @@ class AttnEncoderXL(nn.Module):
                 out = out * math.sqrt(self.d_model)
             out = self.dropout(out)
 
-        mask = ~sequence_mask(lengths).unsqueeze(1)
+        mask = ~_require_onmt()["sequence_mask"](lengths).unsqueeze(1)
 
         for layer in self.attention_layers:
             out = layer(out, mask, distances)
@@ -979,6 +1041,7 @@ class RXNG2Sequencer(nn.Module):
     
     def __init__(self, config, vocab):
         super().__init__()
+        onmt = _require_onmt()
         self.config = config
         self.vocab = vocab
         self.vocab_size = len(self.vocab)
@@ -1008,11 +1071,13 @@ class RXNG2Sequencer(nn.Module):
                                                         intermediate_size=self.config.model.emb_dim,
                                                         num_heads=self.config.model.num_heads,
                                                         hidden_dropout_prob=self.config.model.attn_drop_ratio)
+        else:
+            raise NotImplementedError(f"Attention encoder type {self.config.model.att_encoder_type} not implemented")
             
 
 
 
-        self.decoder_embeddings = Embeddings(
+        self.decoder_embeddings = onmt["Embeddings"](
             word_vec_size=self.config.model.emb_dim,
             word_vocab_size=self.vocab_size,
             word_padding_idx=self.vocab["_PAD"],
@@ -1020,7 +1085,7 @@ class RXNG2Sequencer(nn.Module):
             dropout=self.config.model.drop_ratio
         )
 
-        self.decoder = TransformerDecoder(
+        self.decoder = onmt["TransformerDecoder"](
             num_layers=self.config.model.decoder_num_layers,
             d_model=self.config.model.emb_dim,
             heads=self.config.model.num_heads,
@@ -1088,11 +1153,11 @@ class RXNG2Sequencer(nn.Module):
                     distances
                 )
         elif self.config.model.att_encoder_type == "attn":
-            memory_lengths = torch.bincount(batch).long()
-            max_length = max(memory_lengths)
+            memory_lengths = torch.bincount(batch).long().to(device=hatom.device)
+            max_length = int(memory_lengths.max().item())
             rxn_representation = self.attention_pool(hatom,mol_index)  ## node_representation is equal to hatom
             padded_feat = pad_feat(rxn_representation,batch,self.config.model.emb_dim)
-            rxn_transf_emb = self.attention_encoder(padded_feat)
+            rxn_transf_emb = self.attention_encoder(padded_feat, memory_lengths)
             padded_memory_bank = rxn_transf_emb.transpose(1,0)
         else:
             raise NotImplementedError(f"Attention encoder type {self.config.model.att_encoder_type} not implemented")
@@ -1136,8 +1201,9 @@ class RXNG2Sequencer(nn.Module):
     def infer(self, reaction_batch,
                      batch_size: int, beam_size: int, n_best: int, temperature: float,
                      min_length: int, max_length: int):
+        onmt = _require_onmt()
         if beam_size == 1:
-            decode_strategy = GreedySearch(
+            decode_strategy = onmt["GreedySearch"](
                 pad=self.vocab["_PAD"],
                 bos=self.vocab["_SOS"],
                 eos=self.vocab["_EOS"],
@@ -1151,11 +1217,11 @@ class RXNG2Sequencer(nn.Module):
                 keep_topk=1
             )
         else:
-            global_scorer = GNMTGlobalScorer(alpha=0.0,
+            global_scorer = onmt["GNMTGlobalScorer"](alpha=0.0,
                                              beta=0.0,
                                              length_penalty="none",
                                              coverage_penalty="none")
-            decode_strategy = BeamSearch(
+            decode_strategy = onmt["BeamSearch"](
                 beam_size=beam_size,
                 batch_size=batch_size,
                 pad=self.vocab["_PAD"],

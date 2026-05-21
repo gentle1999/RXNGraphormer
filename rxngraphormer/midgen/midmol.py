@@ -1,15 +1,43 @@
 import re,os
 import numpy as np
+import torch
 from rdkit import Chem
 from rdkit.Chem import rdmolops
-from rxnmapper import RXNMapper
-from localmapper import localmapper
 import rxngraphormer
 from rxngraphormer.midgen.MechFinder import MechFinder
 from rxngraphormer.utils import canonical_smiles
-mapper = localmapper('cpu')  ## avoid some bugs
 finder = MechFinder(collection_dir=f'{os.path.dirname(rxngraphormer.__file__)}/midgen/collections')
-rxn_mapper = RXNMapper()
+mapper = None
+rxn_mapper = None
+
+def get_localmapper():
+    global mapper
+    if mapper is None:
+        from localmapper import localmapper
+
+        mapper = localmapper('cpu')  ## avoid some bugs
+    return mapper
+
+def _new_cpu_rxn_mapper():
+    from rxnmapper import RXNMapper
+
+    # RXNMapper chooses cuda automatically and has no device argument.
+    cuda_is_available = torch.cuda.is_available
+    torch.cuda.is_available = lambda: False
+    try:
+        mapper_ = RXNMapper()
+    finally:
+        torch.cuda.is_available = cuda_is_available
+    mapper_.device = torch.device('cpu')
+    mapper_.model.to(mapper_.device)
+    return mapper_
+
+def get_rxn_mapper():
+    global rxn_mapper
+    if rxn_mapper is None:
+        rxn_mapper = _new_cpu_rxn_mapper()
+    return rxn_mapper
+
 ### Mid molecule generation
 # Extract key information and store it as a collection of the form (atom1 map, atom2 map)
 def get_bond_set(molecules,allowed_at_idx_lst):
@@ -142,11 +170,11 @@ def gen_mech_mid_smi(task,confidence_threshold=0.002):
     pdt_smi_lst = pdt_line.split('.')
     rxn_smiles = f"{rct_line}>>{pdt_line}"
     #atmap_rxn = mapper.get_atom_map(rxn_smiles)
-    atmap_rxn_res = mapper.get_atom_map(rxn_smiles, return_dict=True)
+    atmap_rxn_res = get_localmapper().get_atom_map(rxn_smiles, return_dict=True)
     atmap_rxn = atmap_rxn_res["mapped_rxn"]
     confident = atmap_rxn_res["confident"]
     if not confident:
-        results = rxn_mapper.get_attention_guided_atom_maps([rxn_smiles])
+        results = get_rxn_mapper().get_attention_guided_atom_maps([rxn_smiles])
         atmap_rxn = results[0]["mapped_rxn"]
         if results[0]["confidence"] < confidence_threshold:
             print("confidence too low")
