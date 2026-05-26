@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import importlib.metadata
+import importlib.util
 import platform
 import re
 import sys
-
 
 BLACKWELL_MIN_CUDA_CAPABILITY = (10, 0)
 BLACKWELL_MIN_CUDA_RUNTIME = (12, 8)
@@ -48,7 +47,6 @@ def require_base_version(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("env", choices=["preprocess", "model"])
-    parser.add_argument("--sequence", action="store_true", help="Also require OpenNMT sequence-generation dependencies.")
     args = parser.parse_args()
 
     print(f"python: {sys.version.split()[0]}")
@@ -57,7 +55,7 @@ def main() -> None:
     required = ["rxngraphormer"]
     if args.env == "preprocess":
         required += [
-            "rxngraphormer.preprocess",
+            "rxngraphormer.preprocessing",
             "torch",
             "torch_geometric",
             "pandas",
@@ -68,9 +66,20 @@ def main() -> None:
             "localmapper",
         ]
     else:
-        required += ["rxngraphormer", "torch", "torch_geometric", "pandas", "rdkit", "sklearn", "safetensors"]
-        if args.sequence:
-            required += ["onmt"]
+        required += [
+            "rxngraphormer.preprocessing",
+            "torch",
+            "torch_geometric",
+            "pandas",
+            "dgl",
+            "dgllife",
+            "rdkit",
+            "rxnmapper",
+            "localmapper",
+            "sklearn",
+            "safetensors",
+            "onmt",
+        ]
 
     missing = []
     for module in required:
@@ -113,7 +122,10 @@ def main() -> None:
                     "if a GPU wheel causes trouble on newer hardware, hide CUDA devices "
                     "or run the preprocessing stage in a separate older environment."
                 )
-        elif torch.cuda.is_available():
+        else:
+            print("profile: model environment with rxngraphormer[all] extras")
+
+        if args.env == "model" and torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(0)
             cuda_runtime = version_tuple(torch.version.cuda)
             if (

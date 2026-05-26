@@ -14,21 +14,21 @@ environments:
 - preprocessing environment: dataset generation and atom mapping with the root `preprocess` extra
 
 The same package contains model code, dataset protocol/configuration helpers,
-and preprocessing code under `rxngraphormer.preprocess`. The default install is
-model-only and keeps loose runtime bounds, currently `torch>=2.0` and
-`torch-geometric>=2.3`. The full preprocessing stack, including atom mapping,
-is opt-in through `.[preprocess]`, and `.[all]` installs the single-environment
-end-to-end feature set. These extras do not pin Torch, PyG, DGL, or a CUDA
-wheel in the package metadata.
+and preprocessing code under `rxngraphormer.preprocessing`. The package keeps
+loose runtime bounds, currently `torch>=2.0` and `torch-geometric>=2.3`. The
+full preprocessing stack, including atom mapping, is available through
+`.[preprocess]`, and `.[all]` installs the full routed CLI runtime, including
+OpenNMT for sequence generation. These extras do not pin Torch, PyG, DGL, or a
+CUDA wheel in the package metadata.
 
 The model package no longer depends on `torch-scatter`, `torch-sparse`, `torch-cluster`, `torch-spline-conv`, or `pyg-lib`; the only direct scatter usage has been replaced with PyG's native `torch_geometric.utils.scatter`.
 
 Standard configuration files are TOML, for example `config_toml/buchwald_hartwig_parameters.toml`. Existing `parameters.json` and `config/*.json` files still load through the same dataclass schema for checkpoint compatibility.
 
-Build the main model environment from the repository root. The default root
-installation is model-only; preprocessing is available either through
-`.[all]` in a single compatible environment or through a second environment
-that installs the same package with `.[preprocess]`.
+Build the main model environment from the repository root. The router-managed
+root environment installs `.[all]`; in split layout, preprocessing commands can
+also be routed to a second environment that installs the same package with
+`.[preprocess]`.
 See `docs/environments.md`.
 
 The highest supported single-environment end-to-end hardware target is NVIDIA
@@ -105,40 +105,47 @@ the GPU.
 ```bash
 git clone https://github.com/licheng-xu-echo/RXNGraphormer.git
 cd RXNGraphormer
-scripts/rxngraphormer_pipeline.sh
+scripts/rxngraphormer_pipeline.sh rxngraphormer --help
 ```
 
-The default command uses `--layout auto`. On Hopper or older GPUs it deploys a
-single root environment with `rxngraphormer[all]`; on Blackwell or newer GPUs
-it deploys the root model environment plus `envs/preprocess/.venv` with
-`rxngraphormer[preprocess]`.
+The router uses `--layout auto` by default and initializes the environment
+selected for the command if its virtualenv or required modules are missing. On
+Hopper or older GPUs it can run everything from the root `rxngraphormer[all]`
+environment; on Blackwell or newer GPUs it routes preprocessing to
+`envs/preprocess/.venv` with `rxngraphormer[preprocess]`, while model commands
+still use the root `rxngraphormer[all]` environment.
 
 To force a layout:
 
 ```bash
-scripts/rxngraphormer_pipeline.sh --layout single
-scripts/rxngraphormer_pipeline.sh --layout split
+scripts/rxngraphormer_pipeline.sh --layout single rxngraphormer --help
+scripts/rxngraphormer_pipeline.sh --layout split rxngraphormer --help
 ```
 
-Run the same pipeline command in either layout:
+For users, the recommended command-line interface is always the router script.
+It accepts the same project CLI arguments and chooses the right environment for
+the current hardware:
 
 ```bash
-scripts/rxngraphormer_pipeline.sh \
-  --preprocess-config config/pretrain_parameters.json \
-  --train-config config_toml/buchwald_hartwig_parameters.toml \
-  --eval-config config/buchwald_hartwig_eval.json \
-  --stages preprocess,train,eval
+scripts/rxngraphormer_pipeline.sh preprocess --config config/pretrain_parameters.json
+scripts/rxngraphormer_pipeline.sh train --config config_toml/buchwald_hartwig_parameters.toml
+scripts/rxngraphormer_pipeline.sh eval --config config/buchwald_hartwig_eval.json
 ```
 
-The exposed command interface is the same. In `single` layout every stage runs
-from the root environment. In `split` layout preprocessing is executed from
-`envs/preprocess/.venv`, while train/eval/inference are executed from the root
-environment. Use `--preprocess-cpu` if preprocessing should hide CUDA devices.
+The exposed command interface is the project CLI. In `single` layout every
+command runs from the root environment. In `split` layout preprocessing is
+executed from `envs/preprocess/.venv`, while train/eval/inference are executed
+from the root environment. Use `--preprocess-cpu` if preprocessing should hide
+CUDA devices.
 
-Sequence-generation workflows need the model environment's `sequence` extra:
+Sequence-generation workflows use the same router entry point. The model
+environment already installs `rxngraphormer[all]`, so no extra router option is
+needed:
 
 ```bash
-scripts/rxngraphormer_pipeline.sh --env model --sequence
+scripts/rxngraphormer_pipeline.sh train --config config/uspto_50k_parameters.json
+scripts/rxngraphormer_pipeline.sh eval --config config/uspto_50k_eval.json
+scripts/rxngraphormer_pipeline.sh predict-sequence --help
 ```
 
 ## Python API Examples
@@ -146,11 +153,11 @@ scripts/rxngraphormer_pipeline.sh --env model --sequence
 These Python APIs start from SMILES and may build temporary PyG datasets or run
 atom mapping internally. Use them as complete end-to-end examples only in the
 single-environment layout on supported hardware, currently Hopper-class
-(`sm_90`) or older. On Blackwell or newer hardware, use the split pipeline to
-produce `.pt` artifacts first, then run model-only training, evaluation, or
+(`sm_90`) or older. On Blackwell or newer hardware, use the split router layout to
+produce `.pt` artifacts first, then run training, evaluation, or
 inference from the root environment.
 
-**Run the end-to-end pipeline from Python**
+**Run the router from Python**
 
 ```python3
 import subprocess
@@ -158,17 +165,27 @@ import subprocess
 subprocess.run([
     "scripts/rxngraphormer_pipeline.sh",
     "--layout", "single",
-    "--preprocess-config", "config/pretrain_parameters.json",
-    "--train-config", "config_toml/buchwald_hartwig_parameters.toml",
-    "--eval-config", "config/buchwald_hartwig_eval.json",
-    "--stages", "preprocess,train,eval",
+    "preprocess",
+    "--config", "config/pretrain_parameters.json",
+], check=True)
+subprocess.run([
+    "scripts/rxngraphormer_pipeline.sh",
+    "--layout", "single",
+    "train",
+    "--config", "config_toml/buchwald_hartwig_parameters.toml",
+], check=True)
+subprocess.run([
+    "scripts/rxngraphormer_pipeline.sh",
+    "--layout", "single",
+    "eval",
+    "--config", "config/buchwald_hartwig_eval.json",
 ], check=True)
 ```
 
 **Reaction performance prediction**
 
 ```python3
-from rxngraphormer.eval import reaction_prediction
+from rxngraphormer.evaluation.legacy_eval import reaction_prediction
 
 # reactivity prediction
 bh_model_path = "./model_path/buchwald_hartwig/seed0"
@@ -190,7 +207,7 @@ thiol_add_sel_preds = reaction_prediction(thiol_add_model_path, rxn_smiles_lst, 
 **Reaction synthesis planning prediction**
 
 ```python3
-from rxngraphormer.eval import reaction_prediction
+from rxngraphormer.evaluation.legacy_eval import reaction_prediction
 
 # retrosynthesis planning
 uspto_50k_model_path = "./model_path/USPTO_50k"
@@ -214,7 +231,7 @@ pdt_preds = reaction_prediction(uspto_480k_model_path, rct_smiles_lst, task_type
 **Reaction embeddings generation**
 
 ```python3
-from rxngraphormer.rxn_emb import RXNEMB
+from rxngraphormer.inference import RXNEMB
 
 pretrain_model_path = "./model_path/pretrained_classification_model"
 rxnemb_calc_pretrained = RXNEMB(pretrained_model_path=pretrain_model_path, model_type="classifier")
@@ -236,7 +253,7 @@ rxn_emb_finetuned = rxnemb_calc_finetuned.gen_rxn_emb([
 **Fictitious reaction identification**
 
 ```python3
-from rxngraphormer.rxn_emb import RXNClassifier
+from rxngraphormer.inference import RXNClassifier
 
 pretrained_model_path = "./model_path/pretrained_classification_model"
 classifier = RXNClassifier(pretrained_model_path, random_init=False)
@@ -251,7 +268,7 @@ preds, confs = classifier.rxn_pred([
 
 ### Download model weights and dataset
 
-All model weights and preprocessed datasets are available via our [figshare repository](https://doi.org/10.6084/m9.figshare.28356077). Put these files in `model_path` and `dataset` before running pipeline stages that need pretrained checkpoints or prepared datasets:
+All model weights and preprocessed datasets are available via our [figshare repository](https://doi.org/10.6084/m9.figshare.28356077). Put these files in `model_path` and `dataset` before running commands that need pretrained checkpoints or prepared datasets:
 
 ```
 RXNGraphormer
@@ -277,74 +294,59 @@ RXNGraphormer
 |── ...
 ```
 
-### Standard Pipeline
+### Standard CLI Router
 
-The supported command-line entry point is `scripts/rxngraphormer_pipeline.sh`.
-It reads the stage configs, selects the environment layout, deploys missing
-environments, runs preprocessing where appropriate, and then runs
-training/evaluation from the model environment.
+The supported command-line wrapper is `scripts/rxngraphormer_pipeline.sh`.
+It selects the environment layout, initializes the routed environment when it
+is missing, and passes all command arguments unchanged to the project CLI. Use
+this wrapper for normal preprocessing, training, evaluation, compatibility
+checks, and prediction commands. Direct console scripts remain installed for
+advanced development workflows, but user-facing examples should use the router.
 
 **Preprocess datasets**
 
 ```bash
-scripts/rxngraphormer_pipeline.sh \
-  --env preprocess \
-  --preprocess-config config/pretrain_parameters.json \
-  --stages preprocess
+scripts/rxngraphormer_pipeline.sh preprocess --config config/pretrain_parameters.json
 ```
 
 **Train a regression model**
 
 ```bash
-scripts/rxngraphormer_pipeline.sh \
-  --env model \
-  --train-config config_toml/buchwald_hartwig_parameters.toml \
-  --stages train
+scripts/rxngraphormer_pipeline.sh train --config config_toml/buchwald_hartwig_parameters.toml
 ```
 
 **Evaluate reaction performance prediction**
 
 ```bash
-scripts/rxngraphormer_pipeline.sh \
-  --env model \
-  --eval-config config/buchwald_hartwig_eval.json \
-  --stages eval
+scripts/rxngraphormer_pipeline.sh eval --config config/buchwald_hartwig_eval.json
 ```
 
 **Run a sequence-generation workflow**
 
 ```bash
-scripts/rxngraphormer_pipeline.sh \
-  --sequence \
-  --preprocess-config config/uspto_50k_parameters.json \
-  --train-config config/uspto_50k_parameters.json \
-  --eval-config config/uspto_50k_eval.json \
-  --stages preprocess,train,eval
+scripts/rxngraphormer_pipeline.sh preprocess --config config/uspto_50k_parameters.json
+scripts/rxngraphormer_pipeline.sh train --config config/uspto_50k_parameters.json
+scripts/rxngraphormer_pipeline.sh eval --config config/uspto_50k_eval.json
 ```
 
-**Run selected stages without repeating synchronized environments**
+**Force or skip environment refresh**
 
-The script syncs the selected environment layout before running the requested
-stages.
+The router auto-initializes the selected environment when required. Use
+`--sync` to force a refresh, or `--no-sync` to skip this check.
+
+```bash
+scripts/rxngraphormer_pipeline.sh --sync train --config config_toml/buchwald_hartwig_parameters.toml
+scripts/rxngraphormer_pipeline.sh --no-sync eval --config config/buchwald_hartwig_eval.json
+```
+
+**Pass through CLI options**
 
 ```bash
 scripts/rxngraphormer_pipeline.sh \
-  --env model \
-  --train-config config_toml/buchwald_hartwig_parameters.toml \
-  --eval-config config/buchwald_hartwig_eval.json \
-  --stages train,eval
-```
-
-**Pass through stage-specific options**
-
-```bash
-scripts/rxngraphormer_pipeline.sh \
-  --env model \
-  --train-config config_toml/buchwald_hartwig_parameters.toml \
-  --stages train \
-  --train-arg --max_epochs \
-  --train-arg 10 \
-  --train-arg --eval_after_fit
+  train \
+  --config config_toml/buchwald_hartwig_parameters.toml \
+  --max_epochs 10 \
+  --eval_after_fit
 ```
 
 ## 📑 Some results in paper

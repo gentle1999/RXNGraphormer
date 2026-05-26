@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import http.client
 import json
 import shutil
@@ -9,8 +8,8 @@ import subprocess
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
 
 ARTICLE_ID = "28356077"
 FIGSHARE_API = f"https://api.figshare.com/v2/articles/{ARTICLE_ID}"

@@ -192,9 +192,12 @@ config_toml/**
 scripts/**
 !scripts/
 !scripts/rxngraphormer_pipeline.sh
+!scripts/convert_pt_to_safetensors.py
+!scripts/run_pretrain_graphnorm_preprocess.sh
 !scripts/reproduce/
 !scripts/reproduce/check_environment.py
 !scripts/reproduce/figshare_assets.py
+
 
 # Development/experiment docs.
 # Keep only supported environment documentation.

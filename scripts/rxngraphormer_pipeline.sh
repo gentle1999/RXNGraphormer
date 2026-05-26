@@ -7,66 +7,91 @@ PREPROCESS_PROJECT_DIR="$ROOT_DIR/envs/preprocess"
 PREPROCESS_VENV_DIR="$PREPROCESS_PROJECT_DIR/.venv"
 
 LAYOUT="auto"
-STAGES="sync"
-SYNC_ENVS="all"
-SEQUENCE=0
-CHECK_ENV=1
+SYNC_MODE="auto"
+CHECK_ENV=0
 PREPROCESS_CPU=0
+DRY_RUN=0
 
-PREPROCESS_CONFIG=""
-TRAIN_CONFIG=""
-EVAL_CONFIG=""
-
-PREPROCESS_ARGS=()
-TRAIN_ARGS=()
-EVAL_ARGS=()
 MODEL_SYNC_ARGS=()
 PREPROCESS_INSTALL_ARGS=()
+CLI_ARGS=()
+COMMAND=""
+ENTRY=""
+ROUTE_TARGET=""
 
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/rxngraphormer_pipeline.sh [options]
+  scripts/rxngraphormer_pipeline.sh [router-options] <command> [cli-args...]
 
-Default behavior:
-  Auto-detect the hardware and choose a single end-to-end environment when
-  possible. If the hardware can support it, the root environment is used with
-  rxngraphormer[all]. Otherwise the root environment stays model-only and a
-  separate preprocessing environment is created under envs/preprocess/.venv
-  with rxngraphormer[preprocess].
+Environment router for the RXNGraphormer CLI entry points. Router options must
+appear before <command>; every argument after <command> is passed unchanged to
+the selected RXNGraphormer CLI.
 
-Options:
+Commands:
+  rxngraphormer
+  rxngraphormer-train
+  rxngraphormer-train-legacy
+  rxngraphormer-train-lit
+  rxngraphormer-eval
+  rxngraphormer-eval-legacy
+  rxngraphormer-compat
+  rxngraphormer-predict
+  rxngraphormer-predict-sequence
+  rxngraphormer-preprocess
+
+Aliases:
+  train              -> rxngraphormer-train
+  train-legacy       -> rxngraphormer-train-legacy
+  train-lit          -> rxngraphormer-train-lit
+  eval               -> rxngraphormer-eval
+  eval-legacy        -> rxngraphormer-eval-legacy
+  compat             -> rxngraphormer-compat
+  predict            -> rxngraphormer-predict
+  predict-sequence   -> rxngraphormer-predict-sequence
+  preprocess         -> rxngraphormer-preprocess
+
+Router options:
   --layout NAME              Environment layout: auto,single,split
                              Default: auto
-  --stages LIST              Comma list: sync,preprocess,train,eval
-                             Default: sync
-  --env NAME                 Environments to sync: all,model,preprocess,none
-                             Default: all
-  --model-env DIR            Main model environment directory
+  --model-env DIR            Model environment project directory
                              Default: repository root
-  --preprocess-project DIR    Preprocessing project directory
+  --preprocess-project DIR   Preprocessing project directory
                              Default: envs/preprocess
   --preprocess-venv DIR      Virtualenv used by split preprocessing
                              Default: envs/preprocess/.venv
-  --preprocess-cpu           Hide CUDA devices during preprocessing
-  --no-check-env             Skip compatibility checks after sync
-  --sequence                 Include the sequence extra for model sync/run
+  --sync                     Sync the selected environment before running
+  --no-sync                  Never sync before running
+  --check-env                Run the selected environment compatibility check
+                             before executing the command
+  --no-check-env             Disable compatibility checks
+                             Default
+  --preprocess-cpu           Hide CUDA devices for split preprocessing commands
+                             and preprocessing compatibility checks
   --model-sync-arg ARG       Extra argument passed to uv sync for the model env
   --preprocess-install-arg ARG
-                             Extra argument passed to uv pip install in split preprocessing
-  --skip-sync                Do not sync environments before running stages
-  --preprocess-config PATH   Config used by rxngraphormer-preprocess
-  --train-config PATH        Config used by rxngraphormer-train
-  --eval-config PATH         Config used by rxngraphormer-eval
-  --preprocess-arg ARG       Extra argument passed to rxngraphormer-preprocess
-  --train-arg ARG            Extra argument passed to rxngraphormer-train
-  --eval-arg ARG             Extra argument passed to rxngraphormer-eval
+                             Extra argument passed to uv pip install in the
+                             split preprocessing environment
+  --dry-run                  Print the resolved route without executing it
   -h, --help                 Show this help
 
+Routing:
+  auto layout selects single for machines without NVIDIA GPUs or with max GPU
+  compute capability <= 9.0. It selects split for newer GPUs.
+
+  By default, the router auto-initializes the selected environment if its
+  virtualenv or required modules are missing. Use --no-sync to disable this.
+
+  single layout sends every command to the root model environment.
+  split layout sends rxngraphormer-preprocess, preprocess, and
+  "rxngraphormer preprocess ..." to envs/preprocess/.venv. Other commands run
+  in the root model environment.
+
 Examples:
-  scripts/rxngraphormer_pipeline.sh
-  scripts/rxngraphormer_pipeline.sh --layout single --stages preprocess,train,eval
-  scripts/rxngraphormer_pipeline.sh --layout split --stages preprocess,train,eval
+  scripts/rxngraphormer_pipeline.sh train --config config_toml/bh_scratch_reproduce.toml
+  scripts/rxngraphormer_pipeline.sh preprocess --config config/pretrain_parameters.json
+  scripts/rxngraphormer_pipeline.sh --layout split --sync preprocess --config config/pretrain_parameters.json
+  scripts/rxngraphormer_pipeline.sh --dry-run rxngraphormer-preprocess --help
 USAGE
 }
 
@@ -84,49 +109,33 @@ abs_path() {
   fi
 }
 
-has_stage() {
-  local needle="$1"
-  case ",$STAGES," in
-    *",$needle,"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-env_selected() {
-  local needle="$1"
-  case "$SYNC_ENVS" in
-    all) return 0 ;;
-    "$needle") return 0 ;;
-    none) return 1 ;;
-    model|preprocess) return 1 ;;
-    *) die "--env must be one of: all, model, preprocess, none" ;;
-  esac
-}
-
-require_file() {
-  local path="$1"
-  [[ -n "$path" ]] || die "required config path is empty"
-  [[ -f "$path" ]] || die "file not found: $path"
-}
-
 require_dir() {
   local path="$1"
   [[ -d "$path" ]] || die "directory not found: $path"
 }
 
-validate_stages() {
-  local old_ifs="$IFS"
-  IFS=","
-  read -ra stage_list <<< "$STAGES"
-  IFS="$old_ifs"
+require_uv() {
+  command -v uv >/dev/null 2>&1 || die "uv is required for this route but was not found on PATH"
+}
 
-  local stage
-  for stage in "${stage_list[@]}"; do
-    case "$stage" in
-      sync|preprocess|train|eval) ;;
-      *) die "--stages contains unsupported stage: $stage" ;;
-    esac
-  done
+uv_in_project() {
+  local project_dir="$1"
+  shift
+  (cd "$project_dir" && uv "$@")
+}
+
+python_has_modules() {
+  local python="$1"
+  shift
+  [[ -x "$python" ]] || return 1
+
+  "$python" - "$@" >/dev/null 2>&1 <<'PY'
+import importlib.util
+import sys
+
+missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]
+raise SystemExit(1 if missing else 0)
+PY
 }
 
 detect_max_compute_capability() {
@@ -135,6 +144,7 @@ detect_max_compute_capability() {
     printf '0\n'
     return
   fi
+
   caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null || true)"
   max="0"
   while IFS= read -r cap; do
@@ -167,120 +177,235 @@ resolve_layout() {
   esac
 }
 
-uv_in_project() {
-  local project_dir="$1"
-  shift
-  (cd "$project_dir" && uv "$@")
+resolve_entry() {
+  local command="$1"
+  case "$command" in
+    rxngraphormer|rxngraphormer-train|rxngraphormer-train-legacy|rxngraphormer-train-lit|\
+rxngraphormer-eval|rxngraphormer-eval-legacy|rxngraphormer-compat|rxngraphormer-predict|\
+rxngraphormer-predict-sequence|rxngraphormer-preprocess)
+      printf '%s\n' "$command"
+      ;;
+    train)
+      printf '%s\n' "rxngraphormer-train"
+      ;;
+    train-legacy)
+      printf '%s\n' "rxngraphormer-train-legacy"
+      ;;
+    train-lit)
+      printf '%s\n' "rxngraphormer-train-lit"
+      ;;
+    eval)
+      printf '%s\n' "rxngraphormer-eval"
+      ;;
+    eval-legacy)
+      printf '%s\n' "rxngraphormer-eval-legacy"
+      ;;
+    compat)
+      printf '%s\n' "rxngraphormer-compat"
+      ;;
+    predict)
+      printf '%s\n' "rxngraphormer-predict"
+      ;;
+    predict-sequence)
+      printf '%s\n' "rxngraphormer-predict-sequence"
+      ;;
+    preprocess)
+      printf '%s\n' "rxngraphormer-preprocess"
+      ;;
+    *)
+      die "unsupported command: $command"
+      ;;
+  esac
+}
+
+resolve_route_target() {
+  local entry="$1"
+  if [[ "$entry" == "rxngraphormer-preprocess" ]]; then
+    printf '%s\n' "preprocess"
+    return
+  fi
+
+  if [[ "$entry" == "rxngraphormer" && "${CLI_ARGS[0]:-}" == "preprocess" ]]; then
+    printf '%s\n' "preprocess"
+    return
+  fi
+
+  printf '%s\n' "model"
+}
+
+selected_runtime_env() {
+  if [[ "$LAYOUT" == "split" && "$ROUTE_TARGET" == "preprocess" ]]; then
+    printf '%s\n' "preprocess"
+  else
+    printf '%s\n' "model"
+  fi
+}
+
+selected_bin_path() {
+  local runtime_env="$1"
+  if [[ "$runtime_env" == "preprocess" ]]; then
+    printf '%s/bin/%s\n' "$PREPROCESS_VENV_DIR" "$ENTRY"
+  else
+    printf '%s/.venv/bin/%s\n' "$MODEL_ENV_DIR" "$ENTRY"
+  fi
 }
 
 sync_model_env() {
+  require_uv
   require_dir "$MODEL_ENV_DIR"
+
   local cmd=(sync)
   cmd+=("${MODEL_SYNC_ARGS[@]}")
   echo "==> Sync model environment: $MODEL_ENV_DIR"
   uv_in_project "$MODEL_ENV_DIR" "${cmd[@]}"
 
-  if [[ "$LAYOUT" == "single" ]]; then
-    local install_cmd=(pip install -e "$ROOT_DIR[all]")
-    echo "==> Install rxngraphormer[all] into single end-to-end environment"
-    uv_in_project "$MODEL_ENV_DIR" "${install_cmd[@]}"
-    return
-  fi
-
-  if [[ "$SEQUENCE" -eq 1 ]]; then
-    echo "==> Install sequence extra into model environment"
-    uv_in_project "$MODEL_ENV_DIR" pip install -e "$ROOT_DIR[sequence]"
-  fi
+  echo "==> Install rxngraphormer[all] into model environment"
+  uv_in_project "$MODEL_ENV_DIR" pip install -e "$ROOT_DIR[all]"
 }
 
 sync_preprocess_env() {
-  if [[ "$LAYOUT" == "single" ]]; then
-    return
-  fi
-  require_dir "$PREPROCESS_PROJECT_DIR"
+  require_uv
+  mkdir -p "$PREPROCESS_PROJECT_DIR"
+
   echo "==> Create preprocessing virtualenv: $PREPROCESS_VENV_DIR"
   uv venv "$PREPROCESS_VENV_DIR" --allow-existing
+
   local install_cmd=(pip install --python "$PREPROCESS_VENV_DIR/bin/python" -e "$ROOT_DIR[preprocess]")
   install_cmd+=("${PREPROCESS_INSTALL_ARGS[@]}")
-  echo "==> Install preprocessing extras"
+  echo "==> Install rxngraphormer[preprocess] into preprocessing environment"
   uv "${install_cmd[@]}"
 }
 
+sync_selected_env() {
+  local runtime_env
+  runtime_env="$(selected_runtime_env)"
+  if [[ "$runtime_env" == "preprocess" ]]; then
+    sync_preprocess_env
+  else
+    sync_model_env
+  fi
+}
+
+should_auto_sync() {
+  local runtime_env bin_path
+  runtime_env="$(selected_runtime_env)"
+  bin_path="$(selected_bin_path "$runtime_env")"
+
+  if [[ "$runtime_env" == "preprocess" ]]; then
+    if [[ ! -x "$bin_path" ]]; then
+      return 0
+    fi
+    if ! python_has_modules "$PREPROCESS_VENV_DIR/bin/python" \
+      rxngraphormer.preprocessing torch torch_geometric pandas dgl dgllife rdkit rxnmapper localmapper; then
+      return 0
+    fi
+    return 1
+  fi
+
+  local model_python="$MODEL_ENV_DIR/.venv/bin/python"
+  if [[ ! -x "$model_python" || ! -x "$bin_path" ]]; then
+    return 0
+  fi
+
+  if ! python_has_modules "$model_python" \
+    rxngraphormer rxngraphormer.preprocessing torch torch_geometric pandas rdkit sklearn safetensors \
+    dgl dgllife rxnmapper localmapper onmt; then
+    return 0
+  fi
+
+  return 1
+}
+
+sync_if_needed() {
+  case "$SYNC_MODE" in
+    never)
+      return
+      ;;
+    always)
+      sync_selected_env
+      ;;
+    auto)
+      if should_auto_sync; then
+        sync_selected_env
+      fi
+      ;;
+    *)
+      die "internal error: invalid sync mode: $SYNC_MODE"
+      ;;
+  esac
+}
+
 check_model_env() {
-  [[ "$CHECK_ENV" -eq 1 ]] || return
-  echo "==> Check model environment"
-  uv_in_project "$MODEL_ENV_DIR" run --no-sync python scripts/reproduce/check_environment.py model
+  local profile="$1"
+  require_uv
+  require_dir "$MODEL_ENV_DIR"
+  echo "==> Check model environment profile: $profile"
+  uv_in_project "$MODEL_ENV_DIR" run --no-sync python scripts/reproduce/check_environment.py "$profile"
 }
 
 check_preprocess_env() {
-  [[ "$CHECK_ENV" -eq 1 ]] || return
+  [[ -x "$PREPROCESS_VENV_DIR/bin/python" ]] || die "preprocessing environment is missing: $PREPROCESS_VENV_DIR"
   echo "==> Check preprocessing environment"
-  if [[ "$LAYOUT" == "single" ]]; then
-    uv_in_project "$MODEL_ENV_DIR" run --no-sync python scripts/reproduce/check_environment.py preprocess
+  if [[ "$PREPROCESS_CPU" -eq 1 ]]; then
+    CUDA_VISIBLE_DEVICES="" "$PREPROCESS_VENV_DIR/bin/python" "$ROOT_DIR/scripts/reproduce/check_environment.py" preprocess
   else
-    if [[ "$PREPROCESS_CPU" -eq 1 ]]; then
-      CUDA_VISIBLE_DEVICES="" "$PREPROCESS_VENV_DIR/bin/python" "$ROOT_DIR/scripts/reproduce/check_environment.py" preprocess
-    else
-      "$PREPROCESS_VENV_DIR/bin/python" "$ROOT_DIR/scripts/reproduce/check_environment.py" preprocess
-    fi
+    "$PREPROCESS_VENV_DIR/bin/python" "$ROOT_DIR/scripts/reproduce/check_environment.py" preprocess
   fi
 }
 
-run_preprocess() {
-  echo "==> Preprocess data"
-  [[ -n "$PREPROCESS_CONFIG" ]] || die "--preprocess-config is required for the preprocess stage"
-  require_file "$PREPROCESS_CONFIG"
-  if [[ "$LAYOUT" == "single" ]]; then
-    uv_in_project "$MODEL_ENV_DIR" run --no-sync rxngraphormer-preprocess --config_json "$PREPROCESS_CONFIG" "${PREPROCESS_ARGS[@]}"
+check_selected_env() {
+  [[ "$CHECK_ENV" -eq 1 ]] || return
+
+  if [[ "$LAYOUT" == "split" && "$ROUTE_TARGET" == "preprocess" ]]; then
+    check_preprocess_env
+    return
+  fi
+
+  if [[ "$ROUTE_TARGET" == "preprocess" ]]; then
+    check_model_env preprocess
   else
+    check_model_env model
+  fi
+}
+
+print_route() {
+  local runtime_env bin_path
+  runtime_env="$(selected_runtime_env)"
+  bin_path="$(selected_bin_path "$runtime_env")"
+
+  printf 'layout=%s\n' "$LAYOUT"
+  printf 'runtime_env=%s\n' "$runtime_env"
+  printf 'route_target=%s\n' "$ROUTE_TARGET"
+  printf 'entry=%s\n' "$ENTRY"
+  printf 'bin=%s\n' "$bin_path"
+  printf 'args='
+  printf '%q ' "${CLI_ARGS[@]}"
+  printf '\n'
+}
+
+run_selected_entry() {
+  local runtime_env bin_path
+  runtime_env="$(selected_runtime_env)"
+  bin_path="$(selected_bin_path "$runtime_env")"
+
+  if [[ "$runtime_env" == "preprocess" ]]; then
+    [[ -x "$bin_path" ]] || die "missing preprocessing command: $bin_path; rerun with --sync"
     if [[ "$PREPROCESS_CPU" -eq 1 ]]; then
-      CUDA_VISIBLE_DEVICES="" "$PREPROCESS_VENV_DIR/bin/rxngraphormer-preprocess" --config_json "$PREPROCESS_CONFIG" "${PREPROCESS_ARGS[@]}"
-    else
-      "$PREPROCESS_VENV_DIR/bin/rxngraphormer-preprocess" --config_json "$PREPROCESS_CONFIG" "${PREPROCESS_ARGS[@]}"
+      exec env CUDA_VISIBLE_DEVICES="" "$bin_path" "${CLI_ARGS[@]}"
     fi
+    exec "$bin_path" "${CLI_ARGS[@]}"
   fi
-}
 
-run_train() {
-  echo "==> Train model"
-  [[ -n "$TRAIN_CONFIG" ]] || die "--train-config is required for the train stage"
-  require_file "$TRAIN_CONFIG"
-  local cmd=(run)
-  if [[ "$LAYOUT" == "single" ]]; then
-    cmd+=(--no-sync)
-  fi
-  if [[ "$SEQUENCE" -eq 1 ]]; then
-    cmd+=(--extra sequence)
-  fi
-  uv_in_project "$MODEL_ENV_DIR" "${cmd[@]}" rxngraphormer-train --config "$TRAIN_CONFIG" "${TRAIN_ARGS[@]}"
-}
-
-run_eval() {
-  echo "==> Evaluate / run inference"
-  [[ -n "$EVAL_CONFIG" ]] || die "--eval-config is required for the eval stage"
-  require_file "$EVAL_CONFIG"
-  local cmd=(run)
-  if [[ "$LAYOUT" == "single" ]]; then
-    cmd+=(--no-sync)
-  fi
-  if [[ "$SEQUENCE" -eq 1 ]]; then
-    cmd+=(--extra sequence)
-  fi
-  uv_in_project "$MODEL_ENV_DIR" "${cmd[@]}" rxngraphormer-eval --config_json "$EVAL_CONFIG" "${EVAL_ARGS[@]}"
+  require_uv
+  require_dir "$MODEL_ENV_DIR"
+  cd "$MODEL_ENV_DIR"
+  exec uv run --no-sync "$ENTRY" "${CLI_ARGS[@]}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --layout)
       LAYOUT="${2:?}"
-      shift 2
-      ;;
-    --stages)
-      STAGES="${2:?}"
-      shift 2
-      ;;
-    --env)
-      SYNC_ENVS="${2:?}"
       shift 2
       ;;
     --model-env)
@@ -295,29 +420,25 @@ while [[ $# -gt 0 ]]; do
       PREPROCESS_VENV_DIR="$(abs_path "${2:?}")"
       shift 2
       ;;
-    --preprocess-cpu)
-      PREPROCESS_CPU=1
+    --sync)
+      SYNC_MODE="always"
+      shift
+      ;;
+    --no-sync)
+      SYNC_MODE="never"
+      shift
+      ;;
+    --check-env)
+      CHECK_ENV=1
       shift
       ;;
     --no-check-env)
       CHECK_ENV=0
       shift
       ;;
-    --sequence)
-      SEQUENCE=1
+    --preprocess-cpu)
+      PREPROCESS_CPU=1
       shift
-      ;;
-    --preprocess-config)
-      PREPROCESS_CONFIG="$(abs_path "${2:?}")"
-      shift 2
-      ;;
-    --train-config)
-      TRAIN_CONFIG="$(abs_path "${2:?}")"
-      shift 2
-      ;;
-    --eval-config)
-      EVAL_CONFIG="$(abs_path "${2:?}")"
-      shift 2
       ;;
     --model-sync-arg)
       MODEL_SYNC_ARGS+=("${2:?}")
@@ -327,64 +448,51 @@ while [[ $# -gt 0 ]]; do
       PREPROCESS_INSTALL_ARGS+=("${2:?}")
       shift 2
       ;;
-    --skip-sync)
-      SYNC_ENVS="none"
+    --dry-run)
+      DRY_RUN=1
+      SYNC_MODE="never"
+      CHECK_ENV=0
       shift
-      ;;
-    --preprocess-arg)
-      PREPROCESS_ARGS+=("${2:?}")
-      shift 2
-      ;;
-    --train-arg)
-      TRAIN_ARGS+=("${2:?}")
-      shift 2
-      ;;
-    --eval-arg)
-      EVAL_ARGS+=("${2:?}")
-      shift 2
       ;;
     -h|--help)
       usage
       exit 0
       ;;
+    --)
+      shift
+      [[ $# -gt 0 ]] || die "missing command after --"
+      COMMAND="$1"
+      shift
+      CLI_ARGS=("$@")
+      break
+      ;;
+    --*)
+      die "unknown router option: $1"
+      ;;
     *)
-      die "unknown option: $1"
+      COMMAND="$1"
+      shift
+      CLI_ARGS=("$@")
+      break
       ;;
   esac
 done
 
-command -v uv >/dev/null 2>&1 || die "uv is required but was not found on PATH"
-require_dir "$MODEL_ENV_DIR"
+if [[ -z "$COMMAND" ]]; then
+  usage
+  exit 0
+fi
+
+ENTRY="$(resolve_entry "$COMMAND")"
+ROUTE_TARGET="$(resolve_route_target "$ENTRY")"
+
 resolve_layout
-validate_stages
 
-if has_stage sync || [[ "$SYNC_ENVS" != "none" ]]; then
-  if [[ "$LAYOUT" == "single" ]]; then
-    if env_selected model || env_selected preprocess; then
-      sync_model_env
-      check_model_env
-      check_preprocess_env
-    fi
-  else
-    if env_selected model; then
-      sync_model_env
-      check_model_env
-    fi
-    if env_selected preprocess; then
-      sync_preprocess_env
-      check_preprocess_env
-    fi
-  fi
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  print_route
+  exit 0
 fi
 
-if has_stage preprocess; then
-  run_preprocess
-fi
-
-if has_stage train; then
-  run_train
-fi
-
-if has_stage eval; then
-  run_eval
-fi
+sync_if_needed
+check_selected_env
+run_selected_entry

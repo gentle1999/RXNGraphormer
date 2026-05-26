@@ -12,37 +12,42 @@ dependencies = [
     "safetensors>=0.7.0",
     "scikit-learn>=1.7.2",
     "tensorboard>=2.20.0",
+    "tomli>=2.0; python_version < '3.11'",
     "torch>=2.0",
     "torch-geometric>=2.3",
+    "tqdm>=4.67.3",
 ]
 
 [project.optional-dependencies]
 preprocess = [
-    "dgllife==0.3.2; python_version < '3.11'",
-    "joblib>=1.5.2; python_version < '3.11'",
-    "localmapper>=0.1.5; python_version < '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "numpy<2; python_version < '3.11'",
-    "rxnmapper>=0.4.2; python_version < '3.11'",
+    "dgllife==0.3.2",
+    "joblib>=1.5.2",
+    "localmapper>=0.1.5; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "numpy<2",
+    "rxnmapper>=0.4.2",
 ]
 sequence = [
     "opennmt-py==1.2.0",
 ]
 all = [
-    "dgllife==0.3.2; python_version < '3.11'",
-    "joblib>=1.5.2; python_version < '3.11'",
-    "localmapper>=0.1.5; python_version < '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "numpy<2; python_version < '3.11'",
-    "rxnmapper>=0.4.2; python_version < '3.11'",
+    "dgllife==0.3.2",
+    "joblib>=1.5.2",
+    "localmapper>=0.1.5; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "numpy<2",
+    "rxnmapper>=0.4.2",
     "opennmt-py==1.2.0",
 ]
 
 [project.scripts]
+rxngraphormer = "rxngraphormer.cli:main"
 rxngraphormer-train = "rxngraphormer.cli:train_main"
 rxngraphormer-train-legacy = "rxngraphormer.cli:train_legacy_main"
 rxngraphormer-train-lit = "rxngraphormer.cli:train_lit_main"
 rxngraphormer-eval = "rxngraphormer.cli:eval_main"
 rxngraphormer-eval-legacy = "rxngraphormer.cli:eval_legacy_main"
+rxngraphormer-compat = "rxngraphormer.cli:compat_main"
 rxngraphormer-predict = "rxngraphormer.cli:predict_main"
+rxngraphormer-predict-sequence = "rxngraphormer.cli:predict_sequence_main"
 rxngraphormer-preprocess = "rxngraphormer.cli:preprocess_main"
 
 [tool.uv]
@@ -50,7 +55,12 @@ index-url = "https://mirrors.zju.edu.cn/pypi/web/simple"
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.2.0",
+    "ipywidgets>=8.1.8",
     "mypy>=1.18.2",
+    "openpyxl>=3.1.5",
+    "pyright>=1.1.409",
+    "pytest>=8.4.2",
     "ruff>=0.14.5",
 ]
 notebook = [
@@ -67,4 +77,59 @@ source = "vcs"
 fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
-packages = ["rxngraphormer"]
+packages = ["src/rxngraphormer"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src"]
+extend-exclude = [
+    "notebook",
+    "build",
+    "dist",
+    ".venv",
+    "tmp",
+]
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "UP",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rxngraphormer"]
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = false
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+mypy_path = ["src"]
+warn_return_any = false        # 允许函数返回 Any (这对调用未加类型的第三方库很有用)
+warn_unused_configs = true     # 警告无用的配置
+explicit_package_bases = true  # 配合 src 目录结构
+no_site_packages = true        # 避免第三方 stub 质量影响项目 typed surface
+follow_imports = "skip"        # P14 阶段性收敛：只检查纳入 typed surface 的文件
+
+disallow_untyped_defs = false  # 关键！允许编写没有类型注解的函数
+disallow_any_generics = false  # 允许使用 List, Dict 而不必须写 List[int]
+
+check_untyped_defs = true      # 关键！即使函数没写注解，也要检查函数内部的逻辑错误
+no_implicit_optional = true    # 禁止隐式的 Optional (即禁止 x: str = None)
+warn_redundant_casts = true    # 警告多余的 cast
+warn_unused_ignores = false     # 警告多余的 # type: ignore
+
+ignore_missing_imports = true
+exclude = ["tests", "scripts", "build", "dist", ".venv"]

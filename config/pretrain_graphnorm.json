@@ -1,0 +1,89 @@
+{
+  "model": {
+    "emb_dim": 256,
+    "gnn_type": "gcn",
+    "gnn_num_layer": 4,
+    "gnn_aggr": "mean",
+    "node_readout": "mean",
+    "gnn_jk": "last",
+    "graph_pooling": "attention",
+    "trans_num_layer": 4,
+    "trans_readout": "mean",
+    "output_num_layer": 3,
+    "drop_ratio": 0.0,
+    "save_dir": "./model_path/pretrained_classification_graphnorm",
+    "num_heads": 2,
+    "pretrained_model": "",
+    "pretrained_model_path": "",
+    "pretrained_model_freeze": false,
+    "pretrained_lr_scaled_coef": 0.95,
+    "fine_tune": false,
+    "trainable": "",
+    "split_merge_method": "all",
+    "output_act_func": "relu",
+    "encoder_norm": "graphnorm",
+    "rct_norm": "graphnorm",
+    "pdt_norm": "graphnorm",
+    "head_norm": "layernorm"
+  },
+  "optimizer": {
+    "optimizer": "AdamW",
+    "learning_rate": 6.0,
+    "weight_decay": 0.0
+  },
+  "scheduler": {
+    "lr_decay_step_size": 15,
+    "lr_decay_factor": 0.8,
+    "warmup_step": 60000,
+    "type": "noamlr"
+  },
+  "data": {
+    "data_path": "./dataset",
+    "rct_name_regrex": "680w_rxn_data_rct_*.csv",
+    "pdt_name_regrex": "680w_rxn_data_pdt_*.csv",
+    "data_trunck": 0,
+    "batch_size": 5120,
+    "train_ratio": 0.9,
+    "valid_ratio": 0.1,
+    "task": "classification",
+    "seed": 1024,
+    "file_num_trunck": 0,
+    "tag": "pretrain_graphnorm",
+    "multi_process": true,
+    "preprocess_num_workers": 64,
+    "preprocess_batch_size": 256,
+    "preprocess_parallel_mode": "file",
+    "num_workers": 4,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "prefetch_factor": 2,
+    "train_drop_last": false
+  },
+  "training": {
+    "epoch": 20,
+    "loss": "ce",
+    "accum": 1,
+    "clip_norm": 20.0,
+    "log_iter_step": 200
+  },
+  "others": {
+    "device": "cuda:0",
+    "tag": "pretrain_graphnorm",
+    "multi_gpu": false,
+    "local_rank": -1
+  },
+  "runtime": {
+    "enable_amp": true,
+    "amp_dtype": "bf16",
+    "deterministic": false,
+    "benchmark": true,
+    "float32_matmul_precision": "high",
+    "early_stopping_patience": 0,
+    "num_sanity_val_steps": 0,
+    "enable_progress_bar": true,
+    "enable_model_summary": true,
+    "log_epoch_time": true,
+    "log_gpu_memory": true
+  },
+  "task": "classification"
+}

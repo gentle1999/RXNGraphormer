@@ -1,0 +1,40 @@
+{
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/.*",
+    "**/__pycache__",
+    ".venv",
+    "build",
+    "dist",
+    "tmp"
+  ],
+  "extraPaths": [
+    "src"
+  ],
+  "reportConstantRedefinition": "none",
+  "reportArgumentType": "warning",
+  "reportAssignmentType": "warning",
+  "reportAttributeAccessIssue": "warning",
+  "reportCallIssue": "warning",
+  "reportIncompatibleMethodOverride": "warning",
+  "reportIndexIssue": "warning",
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "none",
+  "reportOptionalIterable": "warning",
+  "reportPossiblyUnboundVariable": "warning",
+  "reportPrivateImportUsage": "none",
+  "reportPrivateUsage": "none",
+  "reportReturnType": "warning",
+  "reportOperatorIssue": "warning",
+  "reportUnnecessaryCast": "none",
+  "reportUnnecessaryComparison": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnsupportedDunderAll": "none",
+  "pythonVersion": "3.10"
+}
