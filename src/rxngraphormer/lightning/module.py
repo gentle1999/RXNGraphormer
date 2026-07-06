@@ -210,11 +210,12 @@ class RXNGraphormerLitModule(pl.LightningModule):
             },
         ]
         if as_bool(getattr(self.config.model, "use_mid_inf", False)):
+            mid_lr = pretrained_lr if bool(getattr(model, "_pretrained_mid_encoder_loaded", False)) else learning_rate
             groups.extend(
                 [
                     {
                         "params": filter(lambda param: param.requires_grad, model.mid_encoder.parameters()),
-                        "lr": learning_rate,
+                        "lr": mid_lr,
                     },
                     {
                         "params": filter(lambda param: param.requires_grad, model.mid_iteract.parameters()),
@@ -231,7 +232,9 @@ class RXNGraphormerLitModule(pl.LightningModule):
     def on_train_start(self) -> None:
         if self.optimization_plan is None:
             return
-        self.log("optimization/effective_batch_size", float(self.optimization_plan.effective_batch_size), prog_bar=False)
+        self.log(
+            "optimization/effective_batch_size", float(self.optimization_plan.effective_batch_size), prog_bar=False
+        )
         self.log("optimization/learning_rate", self.optimization_plan.learning_rate, prog_bar=False)
         self.log("optimization/warmup_steps", float(self.optimization_plan.warmup_steps), prog_bar=False)
         self.log("optimization/scheduler_step_scale", self.optimization_plan.scheduler_step_scale, prog_bar=False)
@@ -252,7 +255,9 @@ class RXNGraphormerLitModule(pl.LightningModule):
             classification_result = classification_metrics(outputs, targets)
             self.log(f"{prefix}_loss", classification_result.metrics.loss, prog_bar=False, sync_dist=True)
             self.log(f"{prefix}_acc", classification_result.metrics.accuracy, prog_bar=True, sync_dist=True)
-            self.log(f"{prefix}_confidence", classification_result.metrics.mean_confidence, prog_bar=False, sync_dist=True)
+            self.log(
+                f"{prefix}_confidence", classification_result.metrics.mean_confidence, prog_bar=False, sync_dist=True
+            )
             return
         regression_result = regression_metrics(outputs, targets)
         self.log(f"{prefix}_mae", regression_result.metrics.mae, prog_bar=True, sync_dist=True)

@@ -25,16 +25,16 @@ preprocess = [
     "localmapper>=0.1.5; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "numpy<2",
     "rxnmapper>=0.4.2",
+    "torchdata<=0.7.1",
 ]
-sequence = [
-    "opennmt-py==1.2.0",
-]
+sequence = ["opennmt-py==1.2.0"]
 all = [
     "dgllife==0.3.2",
     "joblib>=1.5.2",
     "localmapper>=0.1.5; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "numpy<2",
     "rxnmapper>=0.4.2",
+    "torchdata<=0.7.1",
     "opennmt-py==1.2.0",
 ]
 
@@ -63,10 +63,7 @@ dev = [
     "pytest>=8.4.2",
     "ruff>=0.14.5",
 ]
-notebook = [
-    "ipykernel>=7.1.0",
-    "ipywidgets>=8.1.8",
-]
+notebook = ["ipykernel>=7.1.0", "ipywidgets>=8.1.8"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -83,26 +80,11 @@ packages = ["src/rxngraphormer"]
 target-version = "py310"
 line-length = 120
 src = ["src"]
-extend-exclude = [
-    "notebook",
-    "build",
-    "dist",
-    ".venv",
-    "tmp",
-]
+extend-exclude = ["notebook", "build", "dist", ".venv", "tmp"]
 
 [tool.ruff.lint]
-select = [
-    "E4",
-    "E7",
-    "E9",
-    "F",
-    "I",
-    "UP",
-]
-ignore = [
-    "E501",
-]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rxngraphormer"]
@@ -117,19 +99,19 @@ keep-runtime-typing = false
 python_version = "3.10"
 files = ["src"]
 mypy_path = ["src"]
-warn_return_any = false        # 允许函数返回 Any (这对调用未加类型的第三方库很有用)
-warn_unused_configs = true     # 警告无用的配置
-explicit_package_bases = true  # 配合 src 目录结构
-no_site_packages = true        # 避免第三方 stub 质量影响项目 typed surface
-follow_imports = "skip"        # P14 阶段性收敛：只检查纳入 typed surface 的文件
+warn_return_any = false       # 允许函数返回 Any (这对调用未加类型的第三方库很有用)
+warn_unused_configs = true    # 警告无用的配置
+explicit_package_bases = true # 配合 src 目录结构
+no_site_packages = true       # 避免第三方 stub 质量影响项目 typed surface
+follow_imports = "skip"       # P14 阶段性收敛：只检查纳入 typed surface 的文件
 
-disallow_untyped_defs = false  # 关键！允许编写没有类型注解的函数
-disallow_any_generics = false  # 允许使用 List, Dict 而不必须写 List[int]
+disallow_untyped_defs = false # 关键！允许编写没有类型注解的函数
+disallow_any_generics = false # 允许使用 List, Dict 而不必须写 List[int]
 
-check_untyped_defs = true      # 关键！即使函数没写注解，也要检查函数内部的逻辑错误
-no_implicit_optional = true    # 禁止隐式的 Optional (即禁止 x: str = None)
-warn_redundant_casts = true    # 警告多余的 cast
-warn_unused_ignores = false     # 警告多余的 # type: ignore
+check_untyped_defs = true   # 关键！即使函数没写注解，也要检查函数内部的逻辑错误
+no_implicit_optional = true # 禁止隐式的 Optional (即禁止 x: str = None)
+warn_redundant_casts = true # 警告多余的 cast
+warn_unused_ignores = false # 警告多余的 # type: ignore
 
 ignore_missing_imports = true
 exclude = ["tests", "scripts", "build", "dist", ".venv"]

@@ -72,10 +72,13 @@ def classification_batch_input(
     *,
     move: bool = True,
 ):
-    if len(batch_data) != 2:
-        raise ValueError("Classification batches must contain reactant/product graph pairs")
-    rct_data, pdt_data = _manager_from_device(device).move(batch_data) if move else batch_data
-    return [rct_data, pdt_data], rct_data.y.view(-1).long()
+    if len(batch_data) == 2:
+        rct_data, pdt_data = _manager_from_device(device).move(batch_data) if move else batch_data
+        return [rct_data, pdt_data], rct_data.y.view(-1).long()
+    if len(batch_data) == 3:
+        rct_data, pdt_data, mid_data = _manager_from_device(device).move(batch_data) if move else batch_data
+        return [rct_data, pdt_data, mid_data], rct_data.y.view(-1).long()
+    raise ValueError("Classification batches must contain pair or triple graph data")
 
 
 def regression_metrics(

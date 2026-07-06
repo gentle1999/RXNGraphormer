@@ -178,6 +178,7 @@ cython_debug/
 envs/*
 !envs/README.md
 !envs/preprocess/
+envs/preprocess/*
 !envs/preprocess/pyproject.toml
 
 # Development/test training configs.
@@ -194,6 +195,10 @@ scripts/**
 !scripts/rxngraphormer_pipeline.sh
 !scripts/convert_pt_to_safetensors.py
 !scripts/run_pretrain_graphnorm_preprocess.sh
+!scripts/full_df/
+scripts/full_df/**
+!scripts/full_df/create_initial_combo_kfold_splits.py
+!scripts/full_df/plot_initial_combo_projection.py
 !scripts/reproduce/
 !scripts/reproduce/check_environment.py
 !scripts/reproduce/figshare_assets.py
@@ -210,6 +215,8 @@ docs/**
 tmp/
 temp/
 .tmp/
+.codex-tmp/
+logs/
 save/
 experiments/
 reports/

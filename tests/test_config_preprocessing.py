@@ -23,6 +23,7 @@ from rxngraphormer.config_utils import align_config
 from rxngraphormer.data.loader import DataLoaderSettings, dataloader_kwargs
 from rxngraphormer.preprocessing import (
     generate_mid_smiles,
+    generate_mid_smiles_batch,
     parse_reaction_smiles,
     preprocess_from_config,
     reaction_has_atom_mapping,
@@ -342,11 +343,7 @@ class PreprocessTableTest(unittest.TestCase):
         self.assertEqual(parsed.reactants, parsed.products)
 
     def test_reaction_smiles_parser_preserves_explicit_mapped_hydrogens(self):
-        parsed = parse_reaction_smiles(
-            "[C:1](=[C:2]([H:5])[H:6])([H:3])[H:4]"
-            ">>"
-            "[C:1]([H:3])([H:4])([H:5])[H:6]"
-        )
+        parsed = parse_reaction_smiles("[C:1](=[C:2]([H:5])[H:6])([H:3])[H:4]>>[C:1]([H:3])([H:4])([H:5])[H:6]")
 
         self.assertIn("[H:3]", parsed.reactants)
         self.assertIn("[H:3]", parsed.products)
@@ -406,9 +403,47 @@ class PreprocessTableTest(unittest.TestCase):
             elif hasattr(midgen_pkg, "midmol"):
                 delattr(midgen_pkg, "midmol")
 
+    def test_midmol_batch_uses_localmapper_list_input(self):
+        import rxngraphormer.midgen.midmol as midmol
+
+        old_mapper = midmol.mapper
+        old_rxn_mapper = midmol.rxn_mapper
+        fake_mapper = mock.Mock()
+        fake_mapper.get_atom_map.return_value = ["A_mapped>>B_mapped", "C_mapped>>D_mapped"]
+        try:
+            midmol.mapper = None
+            midmol.rxn_mapper = None
+            with (
+                mock.patch.object(midmol, "get_localmapper", return_value=fake_mapper),
+                mock.patch.object(
+                    midmol,
+                    "_mech_mid_smi_from_mapped_reaction",
+                    side_effect=lambda rct, pdt, mapped: (f"{mapped}_mid", mapped, f"{rct}>>{pdt}"),
+                ),
+            ):
+                out = midmol.gen_mech_mid_smis([("A", "B"), ("C", "D")])
+
+            self.assertEqual(out[0][0], "A_mapped>>B_mapped_mid")
+            self.assertEqual(out[1][0], "C_mapped>>D_mapped_mid")
+            fake_mapper.get_atom_map.assert_called_once_with(["A>>B", "C>>D"])
+        finally:
+            midmol.mapper = old_mapper
+            midmol.rxn_mapper = old_rxn_mapper
+
     def test_generate_mid_smiles_never_requires_atom_mapping(self):
         with self.assertRaisesRegex(ValueError, "requires atom-mapped reaction SMILES"):
             generate_mid_smiles("CCO>>CC=O", mapping_policy="never")
+
+    def test_generate_mid_smiles_batch_uses_mapper_for_unmapped_reactions(self):
+        mapper = mock.Mock(return_value=[("CC[O]", "", ""), ValueError("cannot map")])
+        fake_midmol = types.SimpleNamespace(gen_mech_mid_smis=mapper)
+
+        with mock.patch.dict("sys.modules", {"rxngraphormer.midgen.midmol": fake_midmol}):
+            out = generate_mid_smiles_batch(["CCO>>CC=O", "CCN>>CC=N"], mapping_policy="auto")
+
+        self.assertEqual(out[0], "CC[O]")
+        self.assertIsInstance(out[1], ValueError)
+        mapper.assert_called_once_with([("CCO", "CC=O"), ("CCN", "CC=N")])
 
     def test_write_reaction_table_files_uses_rxn_smiles_and_mid_smiles_columns(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -589,6 +624,236 @@ class PreprocessTableTest(unittest.TestCase):
         self.assertEqual(dataset_calls[1][1]["num_worker"], 16)
         self.assertEqual(dataset_calls[1][1]["parallel_mode"], "file")
 
+    def test_preprocess_cli_generates_mid_files_for_classification_mid_info(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_path = Path(tmp_dir)
+            (data_path / "rxn_rct_0.csv").write_text("CCO,0\nCCN,1\nCCC,0\n", encoding="utf-8")
+            (data_path / "rxn_pdt_0.csv").write_text("CC=O,0\nCC=N,1\nCC=C,0\n", encoding="utf-8")
+            fake_config = SimpleNamespace(
+                task="classification",
+                data=SimpleNamespace(
+                    input_table="",
+                    data_path=str(data_path),
+                    rct_name_regrex="rxn_rct_*.csv",
+                    pdt_name_regrex="rxn_pdt_*.csv",
+                    mid_name_regrex="rxn_mid_*.csv",
+                    mid_data_file="",
+                    generate_mid=True,
+                    mapping_policy="auto",
+                    data_trunck=0,
+                    file_num_trunck=0,
+                    multi_process=False,
+                    preprocess_num_workers=4,
+                    preprocess_batch_size=64,
+                    preprocess_parallel_mode="reaction",
+                    task="classification",
+                ),
+                model=SimpleNamespace(use_mid_inf=True),
+            )
+            dataset_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+            def fake_multi_dataset(*args: object, **kwargs: object) -> object:
+                dataset_calls.append((args, kwargs))
+                return object()
+
+            with (
+                mock.patch("rxngraphormer.preprocessing.workflow.load_config", return_value=fake_config),
+                mock.patch(
+                    "rxngraphormer.preprocessing.workflow.generate_mid_smiles_batch",
+                    return_value=["CC[O]", "", RuntimeError("cannot map")],
+                ),
+                mock.patch("rxngraphormer.preprocessing.workflow.MultiRXNDataset", side_effect=fake_multi_dataset),
+            ):
+                preprocess_from_config("config.json")
+
+            self.assertEqual((data_path / "rxn_midvalid_rct_0.csv").read_text(encoding="utf-8").strip(), "CCO,0")
+            self.assertEqual((data_path / "rxn_midvalid_pdt_0.csv").read_text(encoding="utf-8").strip(), "CC=O,0")
+            self.assertEqual((data_path / "rxn_midvalid_mid_0.csv").read_text(encoding="utf-8").strip(), "CC[O],0")
+            self.assertEqual([call[1]["name_tag"] for call in dataset_calls], ["rct", "pdt", "mid"])
+            self.assertEqual(
+                [call[1]["name_regrex"] for call in dataset_calls],
+                ["rxn_midvalid_rct_*.csv", "rxn_midvalid_pdt_*.csv", "rxn_midvalid_mid_*.csv"],
+            )
+
+    def test_preprocess_cli_generates_mid_files_in_file_parallel_mode(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_path = Path(tmp_dir)
+            (data_path / "rxn_rct_0.csv").write_text("CCO,0\n", encoding="utf-8")
+            (data_path / "rxn_pdt_0.csv").write_text("CC=O,0\n", encoding="utf-8")
+            (data_path / "rxn_rct_1.csv").write_text("CCN,1\n", encoding="utf-8")
+            (data_path / "rxn_pdt_1.csv").write_text("CC=N,1\n", encoding="utf-8")
+            fake_config = SimpleNamespace(
+                task="classification",
+                data=SimpleNamespace(
+                    input_table="",
+                    data_path=str(data_path),
+                    rct_name_regrex="rxn_rct_*.csv",
+                    pdt_name_regrex="rxn_pdt_*.csv",
+                    mid_name_regrex="rxn_mid_*.csv",
+                    mid_data_file="",
+                    generate_mid=True,
+                    mapping_policy="auto",
+                    data_trunck=0,
+                    file_num_trunck=0,
+                    multi_process=True,
+                    preprocess_num_workers=8,
+                    preprocess_batch_size=64,
+                    preprocess_parallel_mode="file",
+                    task="classification",
+                ),
+                model=SimpleNamespace(use_mid_inf=True),
+            )
+            dataset_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+            pool_processes: list[int] = []
+            pool_initializers: list[object] = []
+
+            class FakePool:
+                def __init__(self, processes: int, initializer: object | None = None) -> None:
+                    pool_processes.append(processes)
+                    pool_initializers.append(initializer)
+
+                def __enter__(self) -> "FakePool":
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    return None
+
+                def imap_unordered(self, worker: object, tasks: object) -> object:
+                    return [worker(task) for task in reversed(list(tasks))]
+
+            def fake_multi_dataset(*args: object, **kwargs: object) -> object:
+                dataset_calls.append((args, kwargs))
+                return object()
+
+            with (
+                mock.patch("rxngraphormer.preprocessing.workflow.load_config", return_value=fake_config),
+                mock.patch(
+                    "rxngraphormer.preprocessing.workflow.generate_mid_smiles_batch",
+                    side_effect=[["CC[N]"], ["CC[O]"]],
+                ),
+                mock.patch("rxngraphormer.preprocessing.workflow.Pool", FakePool),
+                mock.patch("rxngraphormer.preprocessing.workflow.MultiRXNDataset", side_effect=fake_multi_dataset),
+            ):
+                preprocess_from_config("config.json")
+
+            self.assertEqual(pool_processes, [2])
+            self.assertEqual(len(pool_initializers), 1)
+            self.assertIsNotNone(pool_initializers[0])
+            self.assertEqual((data_path / "rxn_midvalid_rct_0.csv").read_text(encoding="utf-8").strip(), "CCO,0")
+            self.assertEqual((data_path / "rxn_midvalid_pdt_0.csv").read_text(encoding="utf-8").strip(), "CC=O,0")
+            self.assertEqual((data_path / "rxn_midvalid_mid_0.csv").read_text(encoding="utf-8").strip(), "CC[O],0")
+            self.assertEqual((data_path / "rxn_midvalid_rct_1.csv").read_text(encoding="utf-8").strip(), "CCN,1")
+            self.assertEqual((data_path / "rxn_midvalid_pdt_1.csv").read_text(encoding="utf-8").strip(), "CC=N,1")
+            self.assertEqual((data_path / "rxn_midvalid_mid_1.csv").read_text(encoding="utf-8").strip(), "CC[N],1")
+            self.assertEqual(
+                [call[1]["name_regrex"] for call in dataset_calls],
+                ["rxn_midvalid_rct_*.csv", "rxn_midvalid_pdt_*.csv", "rxn_midvalid_mid_*.csv"],
+            )
+            self.assertTrue(all(call[1]["parallel_mode"] == "file" for call in dataset_calls))
+
+    def test_preprocess_cli_uses_complete_existing_midvalid_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_path = Path(tmp_dir)
+            (data_path / "rxn_rct_0.csv").write_text("CCO,0\n", encoding="utf-8")
+            (data_path / "rxn_pdt_0.csv").write_text("CC=O,0\n", encoding="utf-8")
+            (data_path / "rxn_midvalid_rct_0.csv").write_text("CCO,0\n", encoding="utf-8")
+            (data_path / "rxn_midvalid_pdt_0.csv").write_text("CC=O,0\n", encoding="utf-8")
+            (data_path / "rxn_midvalid_mid_0.csv").write_text("CC[O],0\n", encoding="utf-8")
+            fake_config = SimpleNamespace(
+                task="classification",
+                data=SimpleNamespace(
+                    input_table="",
+                    data_path=str(data_path),
+                    rct_name_regrex="rxn_rct_*.csv",
+                    pdt_name_regrex="rxn_pdt_*.csv",
+                    mid_name_regrex="rxn_midvalid_mid_*.csv",
+                    mid_data_file="",
+                    generate_mid=True,
+                    mapping_policy="auto",
+                    data_trunck=0,
+                    file_num_trunck=0,
+                    multi_process=False,
+                    preprocess_num_workers=4,
+                    preprocess_batch_size=64,
+                    preprocess_parallel_mode="reaction",
+                    task="classification",
+                ),
+                model=SimpleNamespace(use_mid_inf=True),
+            )
+            dataset_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+            def fake_multi_dataset(*args: object, **kwargs: object) -> object:
+                dataset_calls.append((args, kwargs))
+                return object()
+
+            with (
+                mock.patch("rxngraphormer.preprocessing.workflow.load_config", return_value=fake_config),
+                mock.patch("rxngraphormer.preprocessing.workflow.generate_mid_smiles_batch") as generate_batch,
+                mock.patch("rxngraphormer.preprocessing.workflow.MultiRXNDataset", side_effect=fake_multi_dataset),
+            ):
+                preprocess_from_config("config.json")
+
+            generate_batch.assert_not_called()
+            self.assertEqual(
+                [call[1]["name_regrex"] for call in dataset_calls],
+                ["rxn_midvalid_rct_*.csv", "rxn_midvalid_pdt_*.csv", "rxn_midvalid_mid_*.csv"],
+            )
+
+    def test_preprocess_cli_regenerates_when_existing_midvalid_set_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_path = Path(tmp_dir)
+            (data_path / "rxn_rct_0.csv").write_text("CCO,0\n", encoding="utf-8")
+            (data_path / "rxn_pdt_0.csv").write_text("CC=O,0\n", encoding="utf-8")
+            (data_path / "rxn_rct_1.csv").write_text("CCN,1\n", encoding="utf-8")
+            (data_path / "rxn_pdt_1.csv").write_text("CC=N,1\n", encoding="utf-8")
+            (data_path / "rxn_midvalid_rct_0.csv").write_text("CCO,0\n", encoding="utf-8")
+            (data_path / "rxn_midvalid_pdt_0.csv").write_text("CC=O,0\n", encoding="utf-8")
+            (data_path / "rxn_midvalid_mid_0.csv").write_text("CC[O],0\n", encoding="utf-8")
+            fake_config = SimpleNamespace(
+                task="classification",
+                data=SimpleNamespace(
+                    input_table="",
+                    data_path=str(data_path),
+                    rct_name_regrex="rxn_rct_*.csv",
+                    pdt_name_regrex="rxn_pdt_*.csv",
+                    mid_name_regrex="rxn_midvalid_mid_*.csv",
+                    mid_data_file="",
+                    generate_mid=True,
+                    mapping_policy="auto",
+                    data_trunck=0,
+                    file_num_trunck=0,
+                    multi_process=False,
+                    preprocess_num_workers=4,
+                    preprocess_batch_size=64,
+                    preprocess_parallel_mode="reaction",
+                    task="classification",
+                ),
+                model=SimpleNamespace(use_mid_inf=True),
+            )
+            dataset_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+            def fake_multi_dataset(*args: object, **kwargs: object) -> object:
+                dataset_calls.append((args, kwargs))
+                return object()
+
+            with (
+                mock.patch("rxngraphormer.preprocessing.workflow.load_config", return_value=fake_config),
+                mock.patch(
+                    "rxngraphormer.preprocessing.workflow.generate_mid_smiles_batch",
+                    return_value=["CC[N]"],
+                ) as generate_batch,
+                mock.patch("rxngraphormer.preprocessing.workflow.MultiRXNDataset", side_effect=fake_multi_dataset),
+            ):
+                preprocess_from_config("config.json")
+
+            generate_batch.assert_called_once_with(["CCN>>CC=N"], mapping_policy="auto")
+            self.assertEqual((data_path / "rxn_midvalid_mid_0.csv").read_text(encoding="utf-8").strip(), "CC[O],0")
+            self.assertEqual((data_path / "rxn_midvalid_mid_1.csv").read_text(encoding="utf-8").strip(), "CC[N],1")
+            self.assertEqual(
+                [call[1]["name_regrex"] for call in dataset_calls],
+                ["rxn_midvalid_rct_*.csv", "rxn_midvalid_pdt_*.csv", "rxn_midvalid_mid_*.csv"],
+            )
+
     def test_file_parallel_worker_disables_nested_reaction_multiprocessing(self):
         from rxngraphormer.data.multi_reaction_dataset import _MultiReactionFileTask, _process_reaction_file
         from rxngraphormer.data.reaction_processing import ReactionProcessingSettings
@@ -613,8 +878,12 @@ class PreprocessTableTest(unittest.TestCase):
 
             with (
                 mock.patch("rxngraphormer.data.multi_reaction_dataset.processed_file_exists", return_value=False),
-                mock.patch("rxngraphormer.data.multi_reaction_dataset.process_reaction_lines", return_value=[object()]) as process_lines,
-                mock.patch("rxngraphormer.data.multi_reaction_dataset.InMemoryDataset.collate", return_value=("data", "slices")),
+                mock.patch(
+                    "rxngraphormer.data.multi_reaction_dataset.process_reaction_lines", return_value=[object()]
+                ) as process_lines,
+                mock.patch(
+                    "rxngraphormer.data.multi_reaction_dataset.InMemoryDataset.collate", return_value=("data", "slices")
+                ),
                 mock.patch("rxngraphormer.data.multi_reaction_dataset.save_processed_graph_data") as save_processed,
             ):
                 result = _process_reaction_file(task)

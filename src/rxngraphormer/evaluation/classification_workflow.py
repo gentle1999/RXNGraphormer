@@ -15,9 +15,10 @@ from rxngraphormer.config import load_train_config, resolve_config_file
 from rxngraphormer.serialization import DEFAULT_CHECKPOINT_FILE
 
 from ..compatibility.checkpointing import resolve_model_checkpoint
-from ..data.collate import pair_collate_fn
+from ..config_utils import as_bool
+from ..data.collate import pair_collate_fn, triple_collate_fn
 from ..data.multi_reaction_dataset import MultiRXNDataset
-from ..data.pairing import PairDataset, SizedDataset
+from ..data.pairing import PairDataset, SizedDataset, TripleDataset
 from ..data.reaction_dataset import RXNDataset
 from ..data.splits import get_idx_split
 from ..inference import RXNGraphormerPredictor
@@ -35,6 +36,7 @@ class ClassificationEvaluationSettings:
     batch_size: int | None = None
     max_batches: int | None = None
     device: torch.device | str | None = None
+    use_mid_inf: bool | None = None
 
 
 @dataclass
@@ -97,18 +99,52 @@ def split_name(name: str) -> str:
     return normalized
 
 
-def classification_split_files(config: Any, split: str, *, specific_val: bool) -> dict[str, str]:
+def classification_split_files(
+    config: Any,
+    split: str,
+    *,
+    specific_val: bool,
+    use_mid_inf: bool | None = None,
+) -> dict[str, str]:
     split = split_name(split)
+    use_mid = _classification_uses_mid(config, use_mid_inf)
     if specific_val or _uses_explicit_classification_split_files(config):
         if split == "train":
-            return {"rct": config.data.train_rct_data_file, "pdt": config.data.train_pdt_data_file}
+            files = {
+                "rct": config.data.train_rct_data_file,
+                "pdt": config.data.train_pdt_data_file,
+            }
+            if use_mid:
+                files["mid"] = config.data.train_mid_data_file
+            return files
         if split == "valid":
-            return {"rct": config.data.val_rct_data_file, "pdt": config.data.val_pdt_data_file}
-        return {"rct": config.data.test_rct_data_file, "pdt": config.data.test_pdt_data_file}
-    return {
+            files = {
+                "rct": config.data.val_rct_data_file,
+                "pdt": config.data.val_pdt_data_file,
+            }
+            if use_mid:
+                files["mid"] = config.data.val_mid_data_file
+            return files
+        files = {
+            "rct": config.data.test_rct_data_file or config.data.val_rct_data_file,
+            "pdt": config.data.test_pdt_data_file or config.data.val_pdt_data_file,
+        }
+        if use_mid:
+            files["mid"] = config.data.test_mid_data_file or config.data.val_mid_data_file
+        return files
+    files = {
         "rct": config.data.rct_name_regrex or config.data.rct_data_file,
         "pdt": config.data.pdt_name_regrex or config.data.pdt_data_file,
     }
+    if use_mid:
+        files["mid"] = config.data.mid_name_regrex or config.data.mid_data_file
+    return files
+
+
+def _classification_uses_mid(config: Any, override: bool | None = None) -> bool:
+    if override is not None:
+        return bool(override)
+    return as_bool(getattr(getattr(config, "model", None), "use_mid_inf", False))
 
 
 def _uses_explicit_classification_split_files(config: Any) -> bool:
@@ -122,19 +158,33 @@ def _uses_explicit_classification_split_files(config: Any) -> bool:
     )
 
 
-def build_classification_dataset(config: Any, *, split: str = "valid", specific_val: bool = False):
+def build_classification_dataset(
+    config: Any,
+    *,
+    split: str = "valid",
+    specific_val: bool = False,
+    use_mid_inf: bool | None = None,
+):
     split = split_name(split)
     explicit_files = specific_val or _uses_explicit_classification_split_files(config)
-    files = classification_split_files(config, split, specific_val=specific_val)
+    use_mid = _classification_uses_mid(config, use_mid_inf)
+    files = classification_split_files(config, split, specific_val=specific_val, use_mid_inf=use_mid)
     data_path = config.data.data_path
     trunck = config.data.data_trunck
-    if not files["rct"] or not files["pdt"]:
-        raise ValueError("Classification evaluation requires reactant and product dataset files")
+    required = ("rct", "pdt", "mid") if use_mid else ("rct", "pdt")
+    missing = [key for key in required if not files.get(key)]
+    if missing:
+        raise ValueError(
+            f"Classification evaluation split {split!r} is missing dataset file fields: " + ", ".join(missing)
+        )
 
     if explicit_files:
         rct = RXNDataset(root=data_path, name=files["rct"], trunck=trunck, task="classification")
         pdt = RXNDataset(root=data_path, name=files["pdt"], trunck=trunck, task="classification")
-        return PairDataset(rct, pdt), files
+        if not use_mid:
+            return PairDataset(rct, pdt), files, use_mid
+        mid = RXNDataset(root=data_path, name=files["mid"], trunck=trunck, task="classification")
+        return TripleDataset(rct, pdt, mid), files, use_mid
 
     rct = MultiRXNDataset(
         root=data_path,
@@ -152,8 +202,20 @@ def build_classification_dataset(config: Any, *, split: str = "valid", specific_
         file_num_trunck=config.data.file_num_trunck,
         name_tag="pdt",
     )
-    if len(rct) != len(pdt):
-        raise ValueError("The number of reactant and product classification data are not equal")
+    mid = (
+        MultiRXNDataset(
+            root=data_path,
+            name_regrex=files["mid"],
+            trunck=trunck,
+            task="classification",
+            file_num_trunck=config.data.file_num_trunck,
+            name_tag="mid",
+        )
+        if use_mid
+        else None
+    )
+    if len(rct) != len(pdt) or (mid is not None and len(rct) != len(mid)):
+        raise ValueError("The number of reactant, product, and mid classification data are not equal")
     split_ids = get_idx_split(
         len(rct),
         int(config.data.train_ratio * len(rct)),
@@ -162,7 +224,10 @@ def build_classification_dataset(config: Any, *, split: str = "valid", specific_
     )[split]
     rct_subset = cast(SizedDataset[BaseData], rct[split_ids])
     pdt_subset = cast(SizedDataset[BaseData], pdt[split_ids])
-    return PairDataset(rct_subset, pdt_subset), files
+    if mid is None:
+        return PairDataset(rct_subset, pdt_subset), files, use_mid
+    mid_subset = cast(SizedDataset[BaseData], mid[split_ids])
+    return TripleDataset(rct_subset, pdt_subset, mid_subset), files, use_mid
 
 
 def build_classification_dataloader(
@@ -171,13 +236,19 @@ def build_classification_dataloader(
     split: str = "valid",
     specific_val: bool = False,
     batch_size: int | None = None,
+    use_mid_inf: bool | None = None,
 ):
-    dataset, files = build_classification_dataset(config, split=split, specific_val=specific_val)
+    dataset, files, use_mid = build_classification_dataset(
+        config,
+        split=split,
+        specific_val=specific_val,
+        use_mid_inf=use_mid_inf,
+    )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size or config.data.batch_size,
         shuffle=False,
-        collate_fn=pair_collate_fn,
+        collate_fn=triple_collate_fn if use_mid else pair_collate_fn,
     )
     return dataloader, files
 
@@ -193,6 +264,7 @@ def _evaluate_classification_split_loaded(
         split=settings.split,
         specific_val=settings.specific_val,
         batch_size=settings.batch_size,
+        use_mid_inf=settings.use_mid_inf,
     )
     evaluation = evaluate_classification(
         predictor.model,
@@ -245,6 +317,7 @@ def evaluate_classification_splits(
                 batch_size=settings.batch_size,
                 max_batches=settings.max_batches,
                 device=settings.device,
+                use_mid_inf=settings.use_mid_inf,
             ),
         )
     return results

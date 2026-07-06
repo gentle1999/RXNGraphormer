@@ -3321,6 +3321,7 @@ all = [
     { name = "numpy" },
     { name = "opennmt-py" },
     { name = "rxnmapper" },
+    { name = "torchdata" },
 ]
 preprocess = [
     { name = "dgllife" },
@@ -3328,6 +3329,7 @@ preprocess = [
     { name = "localmapper", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numpy" },
     { name = "rxnmapper" },
+    { name = "torchdata" },
 ]
 sequence = [
     { name = "opennmt-py" },
@@ -3372,6 +3374,8 @@ requires-dist = [
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "torch", specifier = ">=2.0" },
     { name = "torch-geometric", specifier = ">=2.3" },
+    { name = "torchdata", marker = "extra == 'all'", specifier = "<=0.7.1" },
+    { name = "torchdata", marker = "extra == 'preprocess'", specifier = "<=0.7.1" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 provides-extras = ["all", "preprocess", "sequence"]
@@ -3926,15 +3930,23 @@ wheels = [
 
 [[package]]
 name = "torchdata"
-version = "0.11.0"
+version = "0.7.1"
 source = { registry = "https://mirrors.zju.edu.cn/pypi/web/simple" }
 dependencies = [
-    { name = "requests", marker = "(python_full_version < '3.11' and sys_platform == 'emscripten') or (python_full_version < '3.11' and sys_platform == 'win32') or (sys_platform != 'emscripten' and sys_platform != 'win32')" },
-    { name = "torch", marker = "(python_full_version < '3.11' and sys_platform == 'emscripten') or (python_full_version < '3.11' and sys_platform == 'win32') or (sys_platform != 'emscripten' and sys_platform != 'win32')" },
-    { name = "urllib3", marker = "(python_full_version < '3.11' and sys_platform == 'emscripten') or (python_full_version < '3.11' and sys_platform == 'win32') or (sys_platform != 'emscripten' and sys_platform != 'win32')" },
+    { name = "requests" },
+    { name = "torch" },
+    { name = "urllib3" },
 ]
 wheels = [
-    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/95/d4/af694ef718aedbe95a72760ab9ff7a6a7a44ace2d7f70c27bfeb67c5c503/torchdata-0.11.0-py3-none-any.whl", hash = "sha256:52b940fbbe0e00fb21cabddf528449d1bec5bfb0d0823b7487b15f951658ee33" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/d0/97/6f8f2384d9efb2d1bb6966b5300852d704f4943656360e9352e3cc3358b8/torchdata-0.7.1-cp310-cp310-macosx_10_13_x86_64.whl", hash = "sha256:042db39edbc961c50a36c45b89aea4b099858140c13746c7cc7a87b1cc219d0c" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/0f/45/7c4674a8a4ac83f0e130d0991d61ff96a231656112bb7c50618d77ab0a8f/torchdata-0.7.1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:2d2c8482313dd52652caff99dc530433d898a12bb80bc33a0a4d1680d63272e0" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/39/18/6f0d33df4b9fe4d44a779c2c7cc7cb042535a336f051bb0e5b5387844ee6/torchdata-0.7.1-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:eed10b1f9265b30161a8cd129a96cfc7da202cfc70acf8b6a21fd29e18274ca3" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/0e/06/0c916f27ef9f5a566b555f07c82c94fb9277fcabe0fcbf4dfe4505dcb28a/torchdata-0.7.1-cp310-cp310-win_amd64.whl", hash = "sha256:36c591d0910ede6a496d4fccd389f27e7bccabf8b6a8722712ecf28b98bda8ae" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/ad/9a/8b3c64a141b58228419110858acdd5eae7a1b54db9dd8f22a2af956ac53d/torchdata-0.7.1-cp311-cp311-macosx_10_13_x86_64.whl", hash = "sha256:91a78c677a3e4e2447d888587f7ea0b4ddde81ca95adf709ba0d3dc9a4e9542d" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/35/b2/7ed3a80ae0673b940f2af14281dc02dee0f667c6094e6dcd399fa35249a7/torchdata-0.7.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:fa325d628aa6125c6b46b6fa27c94150ca9276edbba1042d3eb3cd9c1039b5a9" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/c1/8d/b17138a9ad7e47dd602587dbcc142bd98374e0c16c0806c2026d8db54242/torchdata-0.7.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d256535648dfb94d1226f233768c6798d1841edfdbf0a09b2115e6cbbda614f9" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/da/8d/e0413f91944f931cb5c685cbd6330ad450f9d5466c466822d25761ca772d/torchdata-0.7.1-cp311-cp311-win_amd64.whl", hash = "sha256:7460a5fa298e7cd5cef98e8e6455d481e5c73d39a462a89a38918389c8153e20" },
+    { url = "https://mirrors.zju.edu.cn/pypi/web/packages/e2/c8/34eda2bd6beb8a11c06cf905db74092bdbc3dec51a48f4f22cc474866a0a/torchdata-0.7.1-py3-none-any.whl", hash = "sha256:9f9476a26987d90fa3f87cb09ec82b78ce6031ddcaa91851c9fa9f732a987ab8" },
 ]
 
 [[package]]

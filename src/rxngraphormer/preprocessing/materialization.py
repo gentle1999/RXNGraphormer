@@ -13,7 +13,6 @@ from rxngraphormer.preprocessing.chemistry import canonical_smiles
 from rxngraphormer.preprocessing.reactions import (
     canonicalize_reaction_side,
     parse_reaction_smiles,
-    reaction_has_atom_mapping,
     split_reaction_smiles,
 )
 
@@ -61,7 +60,7 @@ def read_prediction_table(path: str | os.PathLike) -> list[dict[str, object]]:
         with open(path, newline="") as handle:
             return [dict(row) for row in csv.DictReader(handle)]
     if suffix in {".parquet", ".pq"}:
-        return pd.read_parquet(path).to_dict(orient="records") # type: ignore
+        return pd.read_parquet(path).to_dict(orient="records")  # type: ignore
     raise ValueError("Prediction table must be .csv, .parquet, or .pq")
 
 
@@ -204,19 +203,19 @@ def write_reaction_table_files(
     mid_rows: list[dict[str, str]] = []
     for row in table.to_dict(orient="records"):
         reactants, products = reaction_sides_from_row(
-            row, # type: ignore
+            row,  # type: ignore
             rxn_smiles_column=rxn_smiles_column,
             rct_smiles_column=rct_smiles_column,
             pdt_smiles_column=pdt_smiles_column,
         )
-        target = optional_value(row, target_column, default="0") # type: ignore
+        target = optional_value(row, target_column, default="0")  # type: ignore
         validate_legacy_target(target)
         rct_rows.append({"smiles": canonicalize_reaction_side(reactants), "target": target})
         pdt_rows.append({"smiles": canonicalize_reaction_side(products), "target": target})
 
         if mid_name:
-            if has_value(row, mid_smiles_column): # type: ignore
-                mid_smiles = required_value(row, mid_smiles_column) # type: ignore
+            if has_value(row, mid_smiles_column):  # type: ignore
+                mid_smiles = required_value(row, mid_smiles_column)  # type: ignore
             elif generate_mid:
                 mid_smiles = generate_mid_smiles(
                     f"{reactants}>>{products}",
@@ -249,20 +248,72 @@ def generate_mid_smiles(rxn_smiles: str, *, mapping_policy: str = "auto") -> str
     if mapping_policy not in {"auto", "always", "never"}:
         raise ValueError("mapping_policy must be one of: auto, always, never")
 
-    reactants, products = split_reaction_smiles(rxn_smiles)
+    parsed = parse_reaction_smiles(rxn_smiles)
+    reactants = parsed.reactants
+    products = parsed.products
     folded_rxn = f"{reactants}>>{products}"
-    has_mapping = reaction_has_atom_mapping(rxn_smiles)
     if mapping_policy == "never":
-        if not has_mapping:
+        if not parsed.has_reactant_product_mapping:
             raise ValueError("mapping_policy='never' requires atom-mapped reaction SMILES")
         mapped_rxn = folded_rxn
-    elif mapping_policy == "auto" and has_mapping:
+    elif mapping_policy == "auto" and parsed.has_reactant_product_mapping:
         mapped_rxn = folded_rxn
     else:
-        from rxngraphormer.midgen.midmol import gen_mech_mid_smi
+        from rxngraphormer.midgen import midmol
 
-        return gen_mech_mid_smi((reactants, products))[0]
+        return midmol.gen_mech_mid_smi((reactants, products))[0]
 
+    return _mid_smiles_from_mapped_reaction(reactants, products, mapped_rxn)
+
+
+def generate_mid_smiles_batch(
+    rxn_smiles: Iterable[str],
+    *,
+    mapping_policy: str = "auto",
+) -> list[str | Exception]:
+    mapping_policy = mapping_policy.lower()
+    if mapping_policy not in {"auto", "always", "never"}:
+        raise ValueError("mapping_policy must be one of: auto, always, never")
+
+    rxn_smiles_list = list(rxn_smiles)
+    results: list[str | Exception | None] = [None] * len(rxn_smiles_list)
+    mapper_indices: list[int] = []
+    mapper_tasks: list[tuple[str, str]] = []
+    for idx, rxn_smi in enumerate(rxn_smiles_list):
+        try:
+            parsed = parse_reaction_smiles(rxn_smi)
+            reactants = parsed.reactants
+            products = parsed.products
+            folded_rxn = f"{reactants}>>{products}"
+            if mapping_policy == "never":
+                if not parsed.has_reactant_product_mapping:
+                    raise ValueError("mapping_policy='never' requires atom-mapped reaction SMILES")
+                results[idx] = _mid_smiles_from_mapped_reaction(reactants, products, folded_rxn)
+            elif mapping_policy == "auto" and parsed.has_reactant_product_mapping:
+                results[idx] = _mid_smiles_from_mapped_reaction(reactants, products, folded_rxn)
+            else:
+                mapper_indices.append(idx)
+                mapper_tasks.append((reactants, products))
+        except Exception as exc:
+            results[idx] = exc
+
+    if mapper_tasks:
+        from rxngraphormer.midgen import midmol
+
+        mapper_results = midmol.gen_mech_mid_smis(mapper_tasks)
+        for idx, mapper_result in zip(mapper_indices, mapper_results, strict=True):
+            if isinstance(mapper_result, Exception):
+                results[idx] = mapper_result
+            else:
+                results[idx] = mapper_result[0]
+
+    return [
+        result if result is not None else RuntimeError("mid SMILES generation did not produce a result")
+        for result in results
+    ]
+
+
+def _mid_smiles_from_mapped_reaction(reactants: str, products: str, mapped_rxn: str) -> str:
     from rxngraphormer.midgen.midmol import finder, get_mid_smi_from_rxn, remove_atmmap
 
     updated_reaction, _lrt, _mt_class, _electron_path = finder.get_electron_path(mapped_rxn)
@@ -278,9 +329,7 @@ def generate_mid_smiles(rxn_smiles: str, *, mapping_policy: str = "auto") -> str
         for smi in side.split("."):
             pot_mech_smi_lst.extend(remove_atmmap(smi).split("."))
     mech_mid_smi_lst = [
-        smi
-        for smi in pot_mech_smi_lst + mid_smi_lst
-        if smi not in rct_smi_lst and smi not in pdt_smi_lst
+        smi for smi in pot_mech_smi_lst + mid_smi_lst if smi not in rct_smi_lst and smi not in pdt_smi_lst
     ]
     return canonical_smiles(".".join(sorted(set(mech_mid_smi_lst))))
 
@@ -339,7 +388,4 @@ def has_nonempty_column(table: pd.DataFrame, column: str) -> bool:
 
 def validate_legacy_target(target: str) -> None:
     if "," in target or "\n" in target or "\r" in target:
-        raise ValueError(
-            "Targets used by the legacy graph builder must be scalar values "
-            "without commas or newlines"
-        )
+        raise ValueError("Targets used by the legacy graph builder must be scalar values without commas or newlines")

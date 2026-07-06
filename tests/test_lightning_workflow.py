@@ -7,6 +7,10 @@ from unittest import mock
 
 import torch
 
+from rxngraphormer.config import load_train_config
+from rxngraphormer.data.collate import triple_collate_fn
+from rxngraphormer.data.loader import DataLoaderSettings
+from rxngraphormer.data.pairing import FastBatchTripleDataset
 from rxngraphormer.evaluation.classification_workflow import classification_split_files
 from rxngraphormer.evaluation.regression_workflow import regression_split_files
 from rxngraphormer.lightning.datamodule import RXNGraphormerDataModule
@@ -94,6 +98,69 @@ class LightningWorkflowTest(unittest.TestCase):
         self.assertTrue(torch.equal(split["valid"], torch.tensor([1])))
         self.assertTrue(torch.equal(split["test"], torch.tensor([3])))
 
+    def test_datamodule_preloads_split_graph_cache_when_enabled(self):
+        config = SimpleNamespace(
+            task="regression",
+            data=SimpleNamespace(batch_size=2, preload_graph_cache=True),
+            model=SimpleNamespace(use_mid_inf=True),
+        )
+        datamodule = RXNGraphormerDataModule(config)
+
+        class FakeGraphDataset:
+            def __init__(self, indices):
+                self._indices = indices
+                self.loaded = []
+
+            def indices(self):
+                return self._indices
+
+            def get(self, idx):
+                self.loaded.append(idx)
+                return idx
+
+            def __len__(self):
+                return len(self._indices)
+
+        rct = FakeGraphDataset([2, 0])
+        pdt = FakeGraphDataset([2, 0])
+        mid = FakeGraphDataset([2, 0])
+        datamodule.train_dataset = datamodule._make_dataset(rct, pdt, mid)
+        datamodule.valid_dataset = datamodule._make_dataset(
+            FakeGraphDataset([1]), FakeGraphDataset([1]), FakeGraphDataset([1])
+        )
+        datamodule.test_dataset = datamodule._make_dataset(
+            FakeGraphDataset([3]), FakeGraphDataset([3]), FakeGraphDataset([3])
+        )
+
+        datamodule._preload_graph_cache_if_enabled()
+
+        self.assertEqual(rct.loaded, [2, 0])
+        self.assertEqual(pdt.loaded, [2, 0])
+        self.assertEqual(mid.loaded, [2, 0])
+
+    def test_fast_batch_collate_matches_standard_collate_for_full_df_subset(self):
+        config_path = Path("config_toml/fixed_axis_cv_rerun_20260612/rxngraphormer_standard_oos/ene_fold_6.toml")
+        split_path = Path(
+            "config_toml/full_df_axis_separate_oos_cv_max2_10fold_graphnorm_pretrain/split_manifests/ene_fold_6.json"
+        )
+        if not config_path.exists() or not split_path.exists():
+            self.skipTest("full_df fixed rerun assets are not available")
+        config = load_train_config(config_path)
+        datamodule = RXNGraphormerDataModule(
+            config,
+            split_manifest=split_path,
+            dataloader=DataLoaderSettings(batch_size=8, num_workers=0),
+        )
+        datamodule.setup("fit")
+        indices = [0, 3, 5, 9, 12]
+
+        standard = triple_collate_fn([datamodule.train_dataset[idx] for idx in indices])
+        fast = FastBatchTripleDataset(datamodule.train_dataset)[indices]
+
+        for standard_batch, fast_batch in zip(standard, fast):
+            for key in ("x", "edge_index", "edge_attr", "atom_mass", "mol_index", "y", "batch", "ptr"):
+                self.assertTrue(torch.equal(getattr(standard_batch, key), getattr(fast_batch, key)), key)
+
     def test_datamodule_passes_parallel_preprocess_settings_to_classification_datasets(self):
         config = SimpleNamespace(
             task="classification",
@@ -133,7 +200,9 @@ class LightningWorkflowTest(unittest.TestCase):
             def __getitem__(self, index: object) -> object:
                 return index
 
-        with mock.patch("rxngraphormer.lightning.datamodule.MultiRXNDataset", return_value=FakeDataset()) as dataset_cls:
+        with mock.patch(
+            "rxngraphormer.lightning.datamodule.MultiRXNDataset", return_value=FakeDataset()
+        ) as dataset_cls:
             datamodule = RXNGraphormerDataModule(config)
             datamodule._make_dataset = mock.Mock(return_value=object())
             datamodule.setup()
@@ -197,8 +266,12 @@ class LightningWorkflowTest(unittest.TestCase):
             write_manifest=False,
         )
         with (
-            mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerDataModule", return_value=fake_datamodule) as datamodule_cls,
-            mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=fake_lit_module) as from_config,
+            mock.patch(
+                "rxngraphormer.lightning.workflow.RXNGraphormerDataModule", return_value=fake_datamodule
+            ) as datamodule_cls,
+            mock.patch(
+                "rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=fake_lit_module
+            ) as from_config,
             mock.patch("rxngraphormer.lightning.workflow.build_trainer", return_value=fake_trainer) as trainer_builder,
             mock.patch("rxngraphormer.lightning.workflow.export_model_state_dict"),
             mock.patch("rxngraphormer.lightning.workflow.write_lightning_fit_config"),
@@ -273,8 +346,12 @@ class LightningWorkflowTest(unittest.TestCase):
 
             with (
                 mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerDataModule", return_value=mock.Mock()),
-                mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=mock.Mock()),
-                mock.patch("rxngraphormer.lightning.workflow.build_trainer", return_value=fake_trainer) as trainer_builder,
+                mock.patch(
+                    "rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=mock.Mock()
+                ),
+                mock.patch(
+                    "rxngraphormer.lightning.workflow.build_trainer", return_value=fake_trainer
+                ) as trainer_builder,
                 mock.patch("rxngraphormer.lightning.workflow.export_model_state_dict"),
                 mock.patch("rxngraphormer.lightning.workflow.write_lightning_fit_config"),
             ):
@@ -334,23 +411,36 @@ class LightningWorkflowTest(unittest.TestCase):
         )
         with (
             mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerDataModule", return_value=fake_datamodule),
-            mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=fake_lit_module),
+            mock.patch(
+                "rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=fake_lit_module
+            ),
             mock.patch("rxngraphormer.lightning.workflow.build_trainer", return_value=fake_trainer),
             mock.patch("rxngraphormer.lightning.workflow.export_model_state_dict"),
-            mock.patch("rxngraphormer.lightning.workflow.write_lightning_fit_config", return_value="runs/lit/version_0/parameters.json"),
-            mock.patch("rxngraphormer.lightning.workflow.run_post_fit_regression_eval", return_value={"json": "eval.json"}) as post_eval,
-            mock.patch("rxngraphormer.lightning.workflow.write_fit_manifest", return_value={"output_manifest": "manifest.json"}) as write_manifest,
+            mock.patch(
+                "rxngraphormer.lightning.workflow.write_lightning_fit_config",
+                return_value="runs/lit/version_0/parameters.json",
+            ),
+            mock.patch(
+                "rxngraphormer.lightning.workflow.run_post_fit_regression_eval", return_value={"json": "eval.json"}
+            ) as post_eval,
+            mock.patch(
+                "rxngraphormer.lightning.workflow.write_fit_manifest", return_value={"output_manifest": "manifest.json"}
+            ) as write_manifest,
         ):
             artifacts = fit_config(config, settings)
 
         post_eval.assert_called_once()
-        self.assertEqual(post_eval.call_args.kwargs["checkpoint_path"], "runs/lit/version_0/model/valid_checkpoint.safetensors")
+        self.assertEqual(
+            post_eval.call_args.kwargs["checkpoint_path"], "runs/lit/version_0/model/valid_checkpoint.safetensors"
+        )
         self.assertEqual(post_eval.call_args.kwargs["splits"], ("valid", "test"))
         self.assertEqual(post_eval.call_args.kwargs["scale"], 100.0)
         write_manifest.assert_called_once()
         manifest = write_manifest.call_args.args[0]
         self.assertEqual(manifest["config_path"], "config.json")
-        self.assertEqual(manifest["checkpoint"]["best_model_path"], "runs/lit/version_0/model/valid_checkpoint.safetensors")
+        self.assertEqual(
+            manifest["checkpoint"]["best_model_path"], "runs/lit/version_0/model/valid_checkpoint.safetensors"
+        )
         self.assertEqual(manifest["checkpoint"]["trainer_best_model_path"], "runs/lit/version_0/checkpoints/best.ckpt")
         self.assertEqual(manifest["eval_reports"], {"regression": {"json": "eval.json"}})
         self.assertEqual(artifacts.manifest_paths, {"output_manifest": "manifest.json"})
@@ -403,17 +493,25 @@ class LightningWorkflowTest(unittest.TestCase):
         )
         with (
             mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerDataModule", return_value=fake_datamodule),
-            mock.patch("rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=fake_lit_module),
+            mock.patch(
+                "rxngraphormer.lightning.workflow.RXNGraphormerLitModule.from_config", return_value=fake_lit_module
+            ),
             mock.patch("rxngraphormer.lightning.workflow.build_trainer", return_value=fake_trainer),
             mock.patch("rxngraphormer.lightning.workflow.export_model_state_dict"),
             mock.patch("rxngraphormer.lightning.workflow.write_lightning_fit_config"),
-            mock.patch("rxngraphormer.lightning.workflow.run_post_fit_classification_eval", return_value={"json": "eval.json"}) as post_eval,
-            mock.patch("rxngraphormer.lightning.workflow.write_fit_manifest", return_value={"output_manifest": "manifest.json"}) as write_manifest,
+            mock.patch(
+                "rxngraphormer.lightning.workflow.run_post_fit_classification_eval", return_value={"json": "eval.json"}
+            ) as post_eval,
+            mock.patch(
+                "rxngraphormer.lightning.workflow.write_fit_manifest", return_value={"output_manifest": "manifest.json"}
+            ) as write_manifest,
         ):
             artifacts = fit_config(config, settings)
 
         post_eval.assert_called_once()
-        self.assertEqual(post_eval.call_args.kwargs["checkpoint_path"], "runs/lit/version_0/model/valid_checkpoint.safetensors")
+        self.assertEqual(
+            post_eval.call_args.kwargs["checkpoint_path"], "runs/lit/version_0/model/valid_checkpoint.safetensors"
+        )
         self.assertEqual(post_eval.call_args.kwargs["splits"], ("valid",))
         manifest = write_manifest.call_args.args[0]
         self.assertEqual(manifest["eval_reports"], {"classification": {"json": "eval.json"}})

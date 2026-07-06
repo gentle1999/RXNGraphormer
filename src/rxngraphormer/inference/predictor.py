@@ -47,6 +47,11 @@ def _load_predictor_config(config_path: str | os.PathLike) -> object:
     return config
 
 
+def _predictor_uses_mid(config: object | None) -> bool:
+    model = getattr(config, "model", None)
+    return as_bool(getattr(model, "use_mid_inf", False))
+
+
 @dataclass
 class ClassificationPrediction:
     preds: torch.Tensor
@@ -85,7 +90,9 @@ def export_predictions_csv(result: ClassificationPrediction | RegressionPredicti
     elif isinstance(result, RegressionPrediction):
         preds = result.preds.reshape(result.preds.shape[0], -1)
         targets = result.targets.reshape(result.targets.shape[0], -1) if result.targets is not None else None
-        uncertainty = result.uncertainty.reshape(result.uncertainty.shape[0], -1) if result.uncertainty is not None else None
+        uncertainty = (
+            result.uncertainty.reshape(result.uncertainty.shape[0], -1) if result.uncertainty is not None else None
+        )
         for idx in range(preds.shape[0]):
             row = {"prediction": float(preds[idx, 0].item())}
             if preds.shape[1] > 1:
@@ -147,7 +154,9 @@ class RXNGraphormerPredictor:
         self.device_manager = DeviceManager.from_value(device)
         self.device = self.device_manager.device
 
-        config = cast(_PredictorConfig, _load_predictor_config(config_path or resolve_config_file(pretrained_model_path)))
+        config = cast(
+            _PredictorConfig, _load_predictor_config(config_path or resolve_config_file(pretrained_model_path))
+        )
         if task == "classification":
             model = build_classification_model(config)
         else:
@@ -158,7 +167,9 @@ class RXNGraphormerPredictor:
                 ckpt_file=ckpt_file,
                 checkpoint_path=checkpoint_path,
             )
-            CheckpointAdapter().load_into_model(model, ckpt_path, map_location=self.device_manager.map_location, mode="strict")
+            CheckpointAdapter().load_into_model(
+                model, ckpt_path, map_location=self.device_manager.map_location, mode="strict"
+            )
         else:
             for p in model.parameters():
                 if p.dim() > 1 and p.requires_grad:
@@ -202,30 +213,48 @@ class RXNGraphormerPredictor:
         *,
         rct_name_regrex: str,
         pdt_name_regrex: str,
+        mid_name_regrex: str | None = None,
         batch_size: int = 128,
+        use_mid_inf: bool | None = None,
         return_probabilities: bool = False,
         return_uncertainty: bool = False,
     ) -> ClassificationPrediction:
         if self.task != "classification":
             raise ValueError("predict_from_dataset requires task='classification'")
-        rct_dataset = MultiRXNDataset(root=root, name_regrex=rct_name_regrex)
-        pdt_dataset = MultiRXNDataset(root=root, name_regrex=pdt_name_regrex)
-        pair_dataset: PairDataset[object, object] = PairDataset(rct_dataset, pdt_dataset)
-        pair_dataloader = torch.utils.data.DataLoader(
-            pair_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=pair_collate_fn,
-        )
+        if use_mid_inf is None:
+            use_mid_inf = _predictor_uses_mid(getattr(self, "config", None))
+
+        rct_dataset = MultiRXNDataset(root=root, name_regrex=rct_name_regrex, task="classification")
+        pdt_dataset = MultiRXNDataset(root=root, name_regrex=pdt_name_regrex, task="classification")
+        dataset: PairDataset[object, object] | TripleDataset[object, object, object]
+        if use_mid_inf:
+            if not mid_name_regrex:
+                raise ValueError("mid_name_regrex is required when use_mid_inf=True")
+            mid_dataset = MultiRXNDataset(root=root, name_regrex=mid_name_regrex, task="classification")
+            dataset = TripleDataset(rct_dataset, pdt_dataset, mid_dataset)
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=triple_collate_fn,
+            )
+        else:
+            dataset = PairDataset(rct_dataset, pdt_dataset)
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=pair_collate_fn,
+            )
 
         pred_chunks: list[torch.Tensor] = []
         confidence_chunks: list[torch.Tensor] = []
         probability_chunks: list[torch.Tensor] = []
         model = self.model
         with torch.no_grad():
-            for rct_data, pdt_data in tqdm(pair_dataloader):
-                rct_data, pdt_data = self._move((rct_data, pdt_data))
-                probabilities = cast(torch.Tensor, model([rct_data, pdt_data]))
+            for batch_data in tqdm(dataloader):
+                model_input = _classification_prediction_input(batch_data, self._device_manager())
+                probabilities = cast(torch.Tensor, model(model_input))
                 pred_chunks.append(probabilities.argmax(dim=1).detach().cpu())
                 confidence_chunks.append(probabilities.max(dim=1).values.detach().cpu())
                 if return_probabilities:
@@ -282,6 +311,11 @@ class RXNGraphormerPredictor:
         return_probabilities: bool = False,
         return_uncertainty: bool = False,
     ) -> ClassificationPrediction:
+        if _predictor_uses_mid(getattr(self, "config", None)):
+            raise ValueError(
+                "predict_reactions cannot run a classification model with use_mid_inf=True; "
+                "use predict_table with mid_smiles or predict_from_dataset with mid_name_regrex."
+            )
         rxn_smiles = list(rxn_smiles)
         if len(rxn_smiles) < 2:
             raise AssertionError("rxn_smiles_lst must contain at least 2 reactions")
@@ -292,6 +326,7 @@ class RXNGraphormerPredictor:
                 files.root,
                 rct_name_regrex=files.rct_name,
                 pdt_name_regrex=files.pdt_name,
+                use_mid_inf=False,
                 batch_size=batch_size,
                 return_probabilities=return_probabilities,
                 return_uncertainty=return_uncertainty,
@@ -336,6 +371,29 @@ class RXNGraphormerPredictor:
             raise ValueError("Cannot predict an empty input table")
 
         if self.task == "classification":
+            use_mid = _predictor_uses_mid(getattr(self, "config", None)) if use_mid_inf is None else use_mid_inf
+            if use_mid:
+                with tempfile.TemporaryDirectory(prefix="rxngraphormer_predict_table_") as tmp_dir:
+                    files = write_regression_table_files(
+                        tmp_dir,
+                        rows,
+                        rxn_smiles_column=rxn_smiles_column,
+                        rct_smiles_column=rct_smiles_column,
+                        pdt_smiles_column=pdt_smiles_column,
+                        mid_smiles_column=mid_smiles_column,
+                        target_column=target_column,
+                        require_mid=True,
+                    )
+                    return self.predict_from_dataset(
+                        files.root,
+                        rct_name_regrex=files.rct_name,
+                        pdt_name_regrex=files.pdt_name,
+                        mid_name_regrex=files.mid_name,
+                        batch_size=batch_size,
+                        use_mid_inf=True,
+                        return_probabilities=return_probabilities,
+                        return_uncertainty=return_uncertainty,
+                    )
             rxn_smiles = reaction_smiles_from_rows(
                 rows,
                 rxn_smiles_column=rxn_smiles_column,
@@ -352,7 +410,7 @@ class RXNGraphormerPredictor:
         if return_targets and target_column is None:
             raise ValueError("target_column is required when return_targets=True for table prediction")
         with tempfile.TemporaryDirectory(prefix="rxngraphormer_predict_table_") as tmp_dir:
-            use_mid = as_bool(self.config.model.use_mid_inf) if use_mid_inf is None else use_mid_inf
+            use_mid = _predictor_uses_mid(getattr(self, "config", None)) if use_mid_inf is None else use_mid_inf
             files = write_regression_table_files(
                 tmp_dir,
                 rows,
@@ -409,7 +467,7 @@ class RXNGraphormerPredictor:
         if self.task != "regression":
             raise ValueError("predict_regression_from_dataset requires task='regression'")
         if use_mid_inf is None:
-            use_mid_inf = as_bool(self.config.model.use_mid_inf)
+            use_mid_inf = _predictor_uses_mid(getattr(self, "config", None))
 
         rct_dataset = MultiRXNDataset(root=root, name_regrex=rct_name_regrex, task="regression")
         pdt_dataset = MultiRXNDataset(root=root, name_regrex=pdt_name_regrex, task="regression")
@@ -459,6 +517,16 @@ _read_prediction_table = read_prediction_table
 _reaction_smiles_from_rows = reaction_smiles_from_rows
 
 
+def _classification_prediction_input(batch_data, manager: DeviceManager):
+    if len(batch_data) == 2:
+        rct_data, pdt_data = manager.move(batch_data)
+        return [rct_data, pdt_data]
+    if len(batch_data) == 3:
+        rct_data, pdt_data, mid_data = manager.move(batch_data)
+        return [rct_data, pdt_data, mid_data]
+    raise ValueError("Classification prediction batches must contain pair or triple graph data")
+
+
 def _reaction_pair_embeddings(model: ReactionEmbeddingModel, rct_data, pdt_data) -> torch.Tensor:
     rct_padded_memory_bank, _rct_batch, rct_memory_lengths = model.rct_encoder(rct_data)
     pdt_padded_memory_bank, _pdt_batch, pdt_memory_lengths = model.pdt_encoder(pdt_data)
@@ -478,7 +546,7 @@ def _reaction_pair_embeddings(model: ReactionEmbeddingModel, rct_data, pdt_data)
     else:
         raise ValueError(f"Unknown split_merge_method: {model.split_merge_method}")
     hidden_layers = list(model.decoder.layers[:-1])
-    norm_layers = list(getattr(model.decoder, "norm_layers", model.decoder.batch_norms)[:-1])
+    norm_layers = list(getattr(model.decoder, "norm_layers", getattr(model.decoder, "batch_norms", []))[:-1])
     for lin_layer, norm_layer in zip(hidden_layers, norm_layers):
         rxn_emb = lin_layer(rxn_emb)
         rxn_emb = norm_layer(rxn_emb)

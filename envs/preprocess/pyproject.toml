@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Preprocessing environment wrapper for generating RXNGraphormer datasets"
 requires-python = ">=3.10"
 dependencies = [
+    "torch<=2.4",
+    "torchdata==0.7.1",
     "rxngraphormer[preprocess]",
 ]
 

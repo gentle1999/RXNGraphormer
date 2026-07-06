@@ -53,6 +53,10 @@ def align_config(input_dict: ConfigMapping, type_: AlignedConfigType = "classifi
         "mid_norm": "batchnorm",
         "head_norm": "batchnorm",
         "split_process": False,
+        "use_mid_inf": False,
+        "mid_iteract_method": "attention",
+        "mid_batch_norm": True,
+        "mid_layer_num": 1,
         "split_merge_method": "all",
         "output_act_func": "relu",
     }

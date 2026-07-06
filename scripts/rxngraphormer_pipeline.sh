@@ -270,7 +270,7 @@ sync_preprocess_env() {
   echo "==> Create preprocessing virtualenv: $PREPROCESS_VENV_DIR"
   uv venv "$PREPROCESS_VENV_DIR" --allow-existing
 
-  local install_cmd=(pip install --python "$PREPROCESS_VENV_DIR/bin/python" -e "$ROOT_DIR[preprocess]")
+  local install_cmd=(pip install --python "$PREPROCESS_VENV_DIR/bin/python" -e "$ROOT_DIR[preprocess]" "torch<=2.2.1" "setuptools<82" "dgl<=2.2.0")
   install_cmd+=("${PREPROCESS_INSTALL_ARGS[@]}")
   echo "==> Install rxngraphormer[preprocess] into preprocessing environment"
   uv "${install_cmd[@]}"
@@ -354,7 +354,7 @@ check_preprocess_env() {
 }
 
 check_selected_env() {
-  [[ "$CHECK_ENV" -eq 1 ]] || return
+  [[ "$CHECK_ENV" -eq 1 ]] || return 0
 
   if [[ "$LAYOUT" == "split" && "$ROUTE_TARGET" == "preprocess" ]]; then
     check_preprocess_env

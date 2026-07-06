@@ -22,9 +22,7 @@ def _sequence_smiles_from_args(args: argparse.Namespace, parser: argparse.Argume
     smiles = list(args.input_smiles or [])
     if args.input_file is not None:
         smiles.extend(
-            line.strip()
-            for line in Path(args.input_file).read_text(encoding="utf-8").splitlines()
-            if line.strip()
+            line.strip() for line in Path(args.input_file).read_text(encoding="utf-8").splitlines() if line.strip()
         )
     if not smiles:
         parser.error("--input_smiles or --input_file is required for sequence prediction")
@@ -65,12 +63,16 @@ def predict_main() -> None:
 
     parser = argparse.ArgumentParser(description="Run RXNGraphormer prediction without a Trainer.")
     parser.add_argument("--model_path", required=True, help="Directory containing config and model/<ckpt_file>.")
-    parser.add_argument("--task", choices=["classification", "regression", *SEQUENCE_PREDICTION_TASKS], default="classification")
+    parser.add_argument(
+        "--task", choices=["classification", "regression", *SEQUENCE_PREDICTION_TASKS], default="classification"
+    )
     parser.add_argument("--root", default=None, help="Dataset root containing input CSV files.")
     parser.add_argument("--rct_name_regrex", default=None)
     parser.add_argument("--pdt_name_regrex", default=None)
     parser.add_argument("--mid_name_regrex", default=None)
-    parser.add_argument("--input_table", default=None, help="CSV/Parquet table with rxn_smiles or split SMILES columns.")
+    parser.add_argument(
+        "--input_table", default=None, help="CSV/Parquet table with rxn_smiles or split SMILES columns."
+    )
     parser.add_argument("--rxn_smiles_column", default="rxn_smiles")
     parser.add_argument("--rct_smiles_column", default="rct_smiles")
     parser.add_argument("--pdt_smiles_column", default="pdt_smiles")
@@ -132,7 +134,9 @@ def predict_main() -> None:
             args.root,
             rct_name_regrex=args.rct_name_regrex,
             pdt_name_regrex=args.pdt_name_regrex,
+            mid_name_regrex=args.mid_name_regrex,
             batch_size=args.batch_size,
+            use_mid_inf=use_mid_inf,
             return_probabilities=args.return_probabilities,
             return_uncertainty=args.return_uncertainty,
         )

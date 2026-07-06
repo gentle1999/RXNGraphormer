@@ -75,6 +75,11 @@ def classification_config_kwargs(config: Any, *, output_size: int = 2) -> dict[s
         "rct_norm": getattr(config.model, "rct_norm", None),
         "pdt_norm": getattr(config.model, "pdt_norm", None),
         "head_norm": getattr(config.model, "head_norm", None),
+        "use_mid_inf": as_bool(getattr(config.model, "use_mid_inf", False)),
+        "mid_iteract_method": getattr(config.model, "mid_iteract_method", "attention"),
+        "mid_batch_norm": as_bool(getattr(config.model, "mid_batch_norm", True)),
+        "mid_norm": getattr(config.model, "mid_norm", None),
+        "mid_layer_num": getattr(config.model, "mid_layer_num", 1),
     }
 
 
@@ -140,6 +145,7 @@ def build_regression_model_from_config(config: Any) -> RXNGRegressor:
     pretrained_path = getattr(config.model, "pretrained_model_path", "")
     pretrained_ensemble: dict[str, torch.nn.Module | None] | None = None
     unfreeze_pretrained = False
+    pretrained_mid_loaded = False
     if pretrained_path:
         pretrained_model: RXNGClassifier = build_pretrained_classification_model(
             cast(str, pretrained_path),
@@ -147,25 +153,58 @@ def build_regression_model_from_config(config: Any) -> RXNGRegressor:
         )
         rct_encoder = pretrained_model.rct_encoder
         pdt_encoder = pretrained_model.pdt_encoder
+        mid_encoder = _compatible_pretrained_mid_encoder(pretrained_model, config)
         unfreeze_pretrained = not as_bool(getattr(config.model, "pretrained_model_freeze", False))
         for param in rct_encoder.parameters():
             param.requires_grad = False
         for param in pdt_encoder.parameters():
             param.requires_grad = False
+        if mid_encoder is not None:
+            pretrained_mid_loaded = True
+            for param in mid_encoder.parameters():
+                param.requires_grad = False
         pretrained_ensemble = {
             "pretrained_encoder": None,
             "pretrained_rct_encoder": rct_encoder,
             "pretrained_pdt_encoder": pdt_encoder,
-            "pretrained_mid_encoder": None,
+            "pretrained_mid_encoder": mid_encoder,
         }
     model = build_regression_model(config, pretrained_ensemble=pretrained_ensemble)
+    model.__dict__["_pretrained_mid_encoder_loaded"] = pretrained_mid_loaded
     _xavier_initialize_trainable(model)
     if pretrained_path and unfreeze_pretrained:
         for param in model.rct_encoder.parameters():
             param.requires_grad = True
         for param in model.pdt_encoder.parameters():
             param.requires_grad = True
+        if pretrained_mid_loaded and as_bool(getattr(config.model, "use_mid_inf", False)):
+            for param in model.mid_encoder.parameters():
+                param.requires_grad = True
     return model
+
+
+def _compatible_pretrained_mid_encoder(pretrained_model: RXNGClassifier, config: Any) -> torch.nn.Module | None:
+    if not as_bool(getattr(config.model, "use_mid_inf", False)):
+        return None
+    mid_encoder = getattr(pretrained_model, "mid_encoder", None)
+    if mid_encoder is None:
+        return None
+    expected_emb_dim = _mid_encoder_emb_dim(config)
+    if int(getattr(mid_encoder, "emb_dim", -1)) != expected_emb_dim:
+        return None
+    return cast(torch.nn.Module, mid_encoder)
+
+
+def _mid_encoder_emb_dim(config: Any) -> int:
+    emb_dim = int(config.model.emb_dim)
+    split_merge_method = str(config.model.split_merge_method).lower()
+    if split_merge_method == "only_diff":
+        return emb_dim
+    if split_merge_method == "rct_pdt":
+        return 2 * emb_dim
+    if split_merge_method == "all":
+        return 3 * emb_dim
+    raise ValueError("split_merge_method must be one of: only_diff, rct_pdt, all")
 
 
 def _xavier_initialize_trainable(model: torch.nn.Module) -> None:

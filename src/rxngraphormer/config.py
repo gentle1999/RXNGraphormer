@@ -79,11 +79,7 @@ class ConfigNamespace(CompatMixin):
         return key in self.__dict__ and key != "_data"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            key: _to_plain(value)
-            for key, value in self.__dict__.items()
-            if key != "_data"
-        }
+        return {key: _to_plain(value) for key, value in self.__dict__.items() if key != "_data"}
 
 
 @dataclass
@@ -254,6 +250,8 @@ class DataConfig(CompatMixin):
     pin_memory: bool = False
     persistent_workers: bool = False
     prefetch_factor: int | None = None
+    preload_graph_cache: bool = False
+    fast_batch_collate: bool = False
     train_drop_last: bool = False
     train_ratio: float = 0.8
     valid_ratio: float = 0.2

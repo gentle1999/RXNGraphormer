@@ -187,21 +187,10 @@ def get_mid_smi_from_rxn(updated_reaction: str) -> list[str]:
     return concat_mid_smis
 
 
-def gen_mech_mid_smi(task: tuple[str, str], confidence_threshold: float = 0.002) -> tuple[str, str, str]:
-    rct_line, pdt_line = task
+def _mech_mid_smi_from_mapped_reaction(rct_line: str, pdt_line: str, atmap_rxn: str) -> tuple[str, str, str]:
     rct_smi_lst = rct_line.split(".")
     pdt_smi_lst = pdt_line.split(".")
     rxn_smiles = f"{rct_line}>>{pdt_line}"
-    # atmap_rxn = mapper.get_atom_map(rxn_smiles)
-    atmap_rxn_res = mapper.get_atom_map(rxn_smiles, return_dict=True)  # type: ignore
-    atmap_rxn = atmap_rxn_res["mapped_rxn"]
-    confident = atmap_rxn_res["confident"]
-    if not confident:
-        results = rxn_mapper.get_attention_guided_atom_maps([rxn_smiles])  # type: ignore
-        atmap_rxn = results[0]["mapped_rxn"]
-        if results[0]["confidence"] < confidence_threshold:
-            print("confidence too low")
-            atmap_rxn = ""
     if atmap_rxn != "":
         updated_reaction, LRT, MT_class, electron_path = finder.get_electron_path(atmap_rxn)
         mid_smi_lst = get_mid_smi_from_rxn(updated_reaction)
@@ -218,3 +207,90 @@ def gen_mech_mid_smi(task: tuple[str, str], confidence_threshold: float = 0.002)
         updated_reaction = rxn_smiles
 
     return mech_mid_smi, atmap_rxn, updated_reaction
+
+
+def gen_mech_mid_smi(task: tuple[str, str], confidence_threshold: float = 0.002) -> tuple[str, str, str]:
+    result = gen_mech_mid_smis([task], confidence_threshold=confidence_threshold)[0]
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+def gen_mech_mid_smis(
+    tasks: list[tuple[str, str]],
+    confidence_threshold: float = 0.002,
+) -> list[tuple[str, str, str] | Exception]:
+    global mapper, rxn_mapper
+    if not tasks:
+        return []
+    mapper = mapper or get_localmapper()
+
+    rxn_smiles = [f"{rct_line}>>{pdt_line}" for rct_line, pdt_line in tasks]
+    atmap_rxns: list[str | Exception] = _localmapper_atom_maps(rxn_smiles)
+
+    missing_indices = [
+        idx for idx, atmap_rxn in enumerate(atmap_rxns) if not isinstance(atmap_rxn, Exception) and not atmap_rxn
+    ]
+    if missing_indices:
+        rxn_mapper = rxn_mapper or get_rxn_mapper()
+        fallback_rxns = [rxn_smiles[idx] for idx in missing_indices]
+        fallback_results = _rxnmapper_atom_maps(fallback_rxns, confidence_threshold=confidence_threshold)
+        for idx, fallback_result in zip(missing_indices, fallback_results, strict=True):
+            atmap_rxns[idx] = fallback_result
+
+    results: list[tuple[str, str, str] | Exception] = []
+    for (rct_line, pdt_line), atmap_rxn in zip(tasks, atmap_rxns, strict=True):
+        if isinstance(atmap_rxn, Exception):
+            results.append(atmap_rxn)
+            continue
+        try:
+            results.append(_mech_mid_smi_from_mapped_reaction(rct_line, pdt_line, atmap_rxn))
+        except Exception as exc:
+            results.append(exc)
+    return results
+
+
+def _localmapper_atom_maps(rxn_smiles: list[str]) -> list[str | Exception]:
+    try:
+        mapped_rxns = mapper.get_atom_map(rxn_smiles)  # type: ignore[union-attr]
+        if isinstance(mapped_rxns, str):
+            mapped_rxns = [mapped_rxns]
+        return list(mapped_rxns)
+    except Exception:
+        results: list[str | Exception] = []
+        for rxn in rxn_smiles:
+            try:
+                results.append(mapper.get_atom_map(rxn))  # type: ignore[union-attr]
+            except Exception as exc:
+                results.append(exc)
+        return results
+
+
+def _rxnmapper_atom_maps(
+    rxn_smiles: list[str],
+    *,
+    confidence_threshold: float,
+) -> list[str | Exception]:
+    try:
+        results = rxn_mapper.get_attention_guided_atom_maps(rxn_smiles)  # type: ignore[union-attr]
+    except Exception:
+        mapped_rxns: list[str | Exception] = []
+        for rxn in rxn_smiles:
+            try:
+                result = rxn_mapper.get_attention_guided_atom_maps([rxn])[0]  # type: ignore[union-attr]
+            except Exception as exc:
+                mapped_rxns.append(exc)
+                continue
+            mapped_rxns.append(_rxnmapper_result_to_mapped_rxn(result, confidence_threshold=confidence_threshold))
+        return mapped_rxns
+    return [_rxnmapper_result_to_mapped_rxn(result, confidence_threshold=confidence_threshold) for result in results]
+
+
+def _rxnmapper_result_to_mapped_rxn(result: dict[str, object], *, confidence_threshold: float) -> str:
+    confidence = result["confidence"]
+    if not isinstance(confidence, int | float | str):
+        raise TypeError(f"Unexpected rxnmapper confidence type: {type(confidence).__name__}")
+    if float(confidence) < confidence_threshold:
+        print("confidence too low")
+        return ""
+    return str(result["mapped_rxn"])
